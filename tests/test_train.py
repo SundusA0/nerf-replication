@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -8,11 +9,14 @@ from nerf.data import SphereScene, Views, analytic_views
 from nerf.render import render_rays
 from nerf.train import (
     TrainConfig,
+    Trainer,
     TrainResult,
     evaluate,
     learning_rate_at,
+    load_checkpoint,
     psnr,
     sample_ray_batch,
+    save_checkpoint,
     train,
 )
 
@@ -220,3 +224,106 @@ def test_evaluating_the_true_scene_reproduces_the_images():
     scores, renders = evaluate(views, truth, config)
     assert torch.allclose(renders, views.images, atol=1e-6)
     assert min(scores) > 60
+
+
+# --------------------------------------------------------------------------
+# Centre-crop warm-up
+# --------------------------------------------------------------------------
+
+
+def test_crop_restricts_pixels_to_the_centre_and_keeps_the_pairing():
+    views = coordinate_views(height=8, width=12)
+    height, width, focal = views.height, views.width, views.focal
+    rays_o, rays_d, target = sample_ray_batch(views, 1000, torch.Generator().manual_seed(0), 0.5)
+
+    rows = (target[:, 0] * height).round()
+    cols = (target[:, 1] * width).round()
+    # the middle half of an 8 x 12 image is rows 2..5 and columns 3..8
+    assert rows.min() == 2 and rows.max() == 5
+    assert cols.min() == 3 and cols.max() == 8
+    assert target.shape[0] == 4 * 6                       # every pixel of the crop, once
+    assert (rows * width + cols).unique().numel() == 4 * 6
+    # rays still belong to their pixels
+    assert torch.allclose(-rays_d[:, 1] * focal + height / 2, rows, atol=1e-4)
+    assert torch.allclose(rays_d[:, 0] * focal + width / 2, cols, atol=1e-4)
+
+
+def test_trainer_crops_only_during_the_warm_up(tiny_views, monkeypatch):
+    seen = []
+    real = nerf.train.sample_ray_batch
+
+    def spy(views, batch_size, generator, crop_fraction=None):
+        seen.append(crop_fraction)
+        return real(views, batch_size, generator, crop_fraction)
+
+    monkeypatch.setattr(nerf.train, "sample_ray_batch", spy)
+    trainer = Trainer(tiny_views, tiny_config(precrop_iterations=2, precrop_fraction=0.5))
+    for _ in range(4):
+        trainer.step()
+    assert seen == [0.5, 0.5, None, None]
+
+
+# --------------------------------------------------------------------------
+# Checkpoints
+# --------------------------------------------------------------------------
+
+
+def parameters_of(trainer):
+    return list(trainer.coarse.parameters()) + list(trainer.fine.parameters())
+
+
+def test_resuming_from_a_checkpoint_continues_exactly(tiny_views, tmp_path):
+    config = tiny_config(lr_decay_steps=10)
+
+    straight = Trainer(tiny_views, config)
+    straight_losses = [straight.step().loss.item() for _ in range(10)]
+
+    first = Trainer(tiny_views, config)
+    for _ in range(5):
+        first.step()
+    save_checkpoint(tmp_path / "checkpoint.pt", first, extra={"elapsed": 12.5})
+
+    resumed = Trainer(tiny_views, config)          # a fresh process would start like this
+    extra = load_checkpoint(tmp_path / "checkpoint.pt", resumed)
+    assert extra == {"elapsed": 12.5}
+    assert resumed.step_count == 5
+    resumed_outputs = [resumed.step() for _ in range(5)]
+
+    assert [out.step for out in resumed_outputs] == [6, 7, 8, 9, 10]
+    assert [out.loss.item() for out in resumed_outputs] == pytest.approx(straight_losses[5:], rel=1e-5)
+    for expected, actual in zip(parameters_of(straight), parameters_of(resumed)):
+        assert torch.allclose(expected, actual, atol=1e-6)
+
+
+def test_checkpoint_refuses_different_settings_but_allows_a_longer_run(tiny_views, tmp_path):
+    trainer = Trainer(tiny_views, tiny_config())
+    trainer.step()
+    save_checkpoint(tmp_path / "checkpoint.pt", trainer)
+
+    longer = Trainer(tiny_views, tiny_config(iterations=5000, log_every=50))
+    load_checkpoint(tmp_path / "checkpoint.pt", longer)
+    assert longer.step_count == 1
+
+    for change in ({"width": 64}, {"num_fine": 16}, {"learning_rate": 1e-3}, {"seed": 1}):
+        different = Trainer(tiny_views, tiny_config(**change))
+        with pytest.raises(ValueError, match=next(iter(change))):
+            load_checkpoint(tmp_path / "checkpoint.pt", different)
+
+
+def test_a_failed_save_leaves_the_previous_checkpoint_intact(tiny_views, tmp_path, monkeypatch):
+    path = tmp_path / "checkpoint.pt"
+    trainer = Trainer(tiny_views, tiny_config())
+    trainer.step()
+    save_checkpoint(path, trainer)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["checkpoint.pt"]   # no temporary file left
+    before = path.read_bytes()
+
+    def dies_halfway(state, file):
+        Path(file).write_bytes(b"half a checkpoint")
+        raise KeyboardInterrupt
+
+    trainer.step()
+    monkeypatch.setattr(nerf.train.torch, "save", dies_halfway)
+    with pytest.raises(KeyboardInterrupt):
+        save_checkpoint(path, trainer)
+    assert path.read_bytes() == before

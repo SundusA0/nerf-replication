@@ -23,7 +23,8 @@ compare with the paper.
 | Network | Section 3, Fig. 7 | Implemented, tested |
 | Hierarchical sampling | Section 5.2 | Implemented, tested |
 | Training loop | Section 5.3, Eq. 6 | Implemented, tested on an analytic scene |
-| Loader for the paper's synthetic scenes, and a camera check | Section 6.1 | Implemented, tested |
+| Loader for the paper's synthetic scenes, and a camera check | Section 6.1 | Implemented, tested; Lego passes |
+| Training script with checkpoints and exact resume | | Implemented, tested |
 | Lego scene: PSNR, SSIM, LPIPS against the paper | Section 6 | Next |
 | Mesh extraction from the trained density | not in the paper | Planned |
 
@@ -64,6 +65,28 @@ axis with world +z up, and that carving a grid with the silhouettes of all
 training views leaves a visual hull which projects back onto those
 silhouettes. It writes its numbers to `results/dataset_check.json`.
 
+On Lego every check passes. All 100 training cameras are 4.0311 from the
+origin and look at it to within 0.04 degrees. The hull spans x from -0.60 to
+0.60, y from -1.10 to 1.12 and z from -0.51 to 0.98, and it projects back onto
+the silhouettes with a mean intersection over union of 0.935 (worst view
+0.916). For comparison, on the analytic test scene mirrored or upside-down
+images score about 0.7, and the check requires 0.8.
+
+## Training
+
+```
+python scripts/02_train.py data/nerf_synthetic/lego --out runs/lego_100px --downscale 8 --iterations 1000
+```
+
+Without `--downscale` and `--iterations` this is the released paper
+configuration: 800x800 images, 1024 rays per step, 64 coarse and 128 fine
+samples per ray, 500k steps. The run directory receives the settings, a log,
+a validation image and PSNR at intervals, and a checkpoint. Running the same
+command again resumes from the checkpoint, and a stop request (Ctrl-C, or the
+termination signal of a job scheduler) lets the current step finish and saves
+first, so an interrupted run follows exactly the same path as an uninterrupted
+one. Run directories are not committed.
+
 ## What is here
 
 - `src/nerf/rays.py`: the camera model. One ray per pixel from a camera pose,
@@ -77,12 +100,13 @@ silhouettes. It writes its numbers to `results/dataset_check.json`.
   whole images.
 - `src/nerf/data.py`: the container for posed images, the loader for the
   paper's synthetic scenes, camera pose helpers and the analytic sphere scene.
-- `src/nerf/train.py`: the training loop, its hyperparameters and evaluation
-  by PSNR.
+- `src/nerf/train.py`: the training step and the state it changes,
+  hyperparameters, checkpoints and evaluation by PSNR.
 - `src/nerf/hull.py`: space carving. The visual hull of a scene from its
   silhouettes, used to check cameras without training.
 - `scripts/00_smoke_test.py`: the end-to-end run described above.
 - `scripts/01_check_dataset.py`: the dataset check described above.
+- `scripts/02_train.py`: training on a synthetic scene, as described above.
 - `tests/`: unit tests for the seven modules.
 
 ## How it is checked
@@ -126,7 +150,12 @@ so the right answer is known:
 - putting the exact analytic scene where the trained networks would go, the
   evaluation code gives back the training images, which ties together the
   poses, focal length, bounds and background used at evaluation time;
-- the loss falls over a short run.
+- the loss falls over a short run;
+- a run restored from a checkpoint ends at the same weights, with the same
+  losses on the way, as a run that was never stopped;
+- a checkpoint is refused if the model or sampling settings differ from the
+  ones it was made with, and a save that dies halfway leaves the previous
+  checkpoint intact.
 
 **Data and cameras.**
 
