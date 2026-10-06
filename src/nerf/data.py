@@ -1,17 +1,22 @@
 """Posed images, the training data of a NeRF.
 
 A NeRF is fitted to one scene from photographs taken at known camera poses.
-`Views` holds such a set. `analytic_views` builds one from a scene whose
-density and colour are known in closed form, so that training can be checked
-without downloading anything.
+`Views` holds such a set. `load_blender` reads one from the NeRF synthetic
+dataset. `analytic_views` builds one from a scene whose density and colour are
+known in closed form, so that training can be checked without downloading
+anything.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
 import torch
+from PIL import Image
 
 from nerf.rays import get_rays
 from nerf.render import render_rays
@@ -27,6 +32,7 @@ class Views:
     near: float               # ray parameter bounds that enclose the scene
     far: float
     white_background: bool    # whether the images are composited over white
+    alpha: torch.Tensor | None = None   # (N, H, W) opacity of each pixel, if known
 
     def __len__(self) -> int:
         return self.images.shape[0]
@@ -43,7 +49,53 @@ class Views:
         return Views(
             self.images.to(device), self.poses.to(device),
             self.focal, self.near, self.far, self.white_background,
+            None if self.alpha is None else self.alpha.to(device),
         )
+
+
+def load_blender(scene_dir, split: str = "train", downscale: int = 1, skip: int = 1) -> Views:
+    """Read one split of a NeRF synthetic ("Blender") scene such as Lego.
+
+    A scene directory holds `transforms_{train,val,test}.json` and the images
+    they name. Each JSON file gives the horizontal field of view shared by all
+    frames and, per frame, an image path and a 4x4 camera-to-world matrix in
+    the convention `get_rays` assumes. The images are 800x800 RGBA with a
+    transparent background.
+
+    As in the released code: the focal length follows from the field of view,
+    resizing is by area averaging and is done on RGBA before compositing, the
+    images are composited over white, and the scene lies between near = 2 and
+    far = 6.
+
+    Args:
+        scene_dir: e.g. data/nerf_synthetic/lego.
+        split: "train" (100 views), "val" (100) or "test" (200).
+        downscale: integer factor to shrink the images by; 2 gives the
+            400x400 "half resolution" of the released example config.
+        skip: keep every `skip`-th frame, to evaluate on a subset.
+    """
+    scene_dir = Path(scene_dir)
+    meta = json.loads((scene_dir / f"transforms_{split}.json").read_text())
+
+    images, poses = [], []
+    for frame in meta["frames"][::skip]:
+        image = Image.open(scene_dir / (frame["file_path"] + ".png")).convert("RGBA")
+        images.append(torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0))
+        poses.append(torch.tensor(frame["transform_matrix"], dtype=torch.float32))
+    rgba = torch.stack(images)  # (N, H, W, 4)
+
+    if downscale > 1:
+        rgba = torch.nn.functional.avg_pool2d(rgba.permute(0, 3, 1, 2), downscale)
+        rgba = rgba.permute(0, 2, 3, 1)
+
+    rgb, alpha = rgba[..., :3], rgba[..., 3]
+    composited = rgb * alpha[..., None] + (1.0 - alpha[..., None])
+    width = composited.shape[2]
+    focal = 0.5 * width / math.tan(0.5 * float(meta["camera_angle_x"]))
+    return Views(
+        composited, torch.stack(poses), focal,
+        near=2.0, far=6.0, white_background=True, alpha=alpha,
+    )
 
 
 def look_at(position, target=(0.0, 0.0, 0.0), up=(0.0, 0.0, 1.0)) -> torch.Tensor:
@@ -149,7 +201,7 @@ def analytic_views(
     near, far = 2.0, 6.0
     focal = 0.5 * image_size / math.tan(0.5 * 0.6911)
 
-    images = []
+    images, alphas = [], []
     for pose in poses:
         rays_o, rays_d = get_rays(image_size, image_size, focal, pose)
         out = render_rays(
@@ -157,4 +209,8 @@ def analytic_views(
             num_coarse=num_samples, num_fine=0, perturb=False, white_background=True,
         )
         images.append(out.coarse.rgb.reshape(image_size, image_size, 3))
-    return Views(torch.stack(images), poses, focal, near, far, white_background=True)
+        alphas.append(out.coarse.acc.reshape(image_size, image_size))
+    return Views(
+        torch.stack(images), poses, focal, near, far,
+        white_background=True, alpha=torch.stack(alphas),
+    )

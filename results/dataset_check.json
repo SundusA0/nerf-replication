@@ -1,0 +1,52 @@
+{
+  "scene": "lego",
+  "frames": {
+    "train": 100,
+    "val": 100,
+    "test": 200
+  },
+  "native_image_size": [
+    800,
+    800
+  ],
+  "checked_at_size": [
+    100,
+    100
+  ],
+  "focal_at_checked_size": 138.889,
+  "camera_distance_min_max": [
+    4.0311,
+    4.0311
+  ],
+  "max_off_axis_degrees": 0.0396,
+  "hull_grid": [
+    128,
+    1.5
+  ],
+  "hull_points": 82266,
+  "hull_extent_xyz": [
+    [
+      -0.602,
+      0.602
+    ],
+    [
+      -1.098,
+      1.122
+    ],
+    [
+      -0.508,
+      0.98
+    ]
+  ],
+  "reprojection_iou_mean": 0.9353,
+  "reprojection_iou_min": 0.916,
+  "reprojection_iou_required": 0.8,
+  "checks": {
+    "all cameras at the same distance": true,
+    "all cameras look at the origin down -z": true,
+    "world +z is up in every image": true,
+    "visual hull is not empty": true,
+    "visual hull lies inside the grid": true,
+    "hull matches silhouettes (IoU > 0.8)": true
+  }
+}

@@ -2,7 +2,9 @@
 
 NeRF renders an image one pixel at a time: a pinhole camera sends a ray through
 each pixel, and the colour of the pixel is the volume rendering integral along
-that ray (Mildenhall et al. 2020, Section 4). This module builds the rays.
+that ray (Mildenhall et al. 2020, Section 4). This module is the camera model:
+`get_rays` goes from pixels to rays, `project_points` from 3D points back to
+pixels.
 """
 
 from __future__ import annotations
@@ -61,3 +63,29 @@ def get_rays(
     directions = dirs_cam @ rotation.T
     origins = c2w[:3, 3].expand(directions.shape)
     return origins, directions
+
+
+def project_points(
+    points: torch.Tensor, height: int, width: int, focal: float, c2w: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Where world points appear in the image: the inverse of `get_rays`.
+
+    Args:
+        points: (..., 3) positions in world coordinates.
+        height, width, focal, c2w: the camera, as in `get_rays`.
+
+    Returns:
+        cols, rows: (...) continuous pixel coordinates. A point on the ray that
+            `get_rays` sends through pixel (row j, column i) gets cols = i and
+            rows = j.
+        depth: (...) the ray parameter t at the point. It is positive in front
+            of the camera; points with depth <= 0 are behind it and their
+            pixel coordinates are meaningless.
+    """
+    rotation, position = c2w[:3, :3], c2w[:3, 3]
+    # Camera coordinates R^T (p - o), written for row vectors.
+    cam = (points - position) @ rotation
+    depth = -cam[..., 2]
+    cols = focal * cam[..., 0] / depth + 0.5 * width
+    rows = -focal * cam[..., 1] / depth + 0.5 * height
+    return cols, rows, depth

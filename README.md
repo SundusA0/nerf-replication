@@ -23,6 +23,7 @@ compare with the paper.
 | Network | Section 3, Fig. 7 | Implemented, tested |
 | Hierarchical sampling | Section 5.2 | Implemented, tested |
 | Training loop | Section 5.3, Eq. 6 | Implemented, tested on an analytic scene |
+| Loader for the paper's synthetic scenes, and a camera check | Section 6.1 | Implemented, tested |
 | Lego scene: PSNR, SSIM, LPIPS against the paper | Section 6 | Next |
 | Mesh extraction from the trained density | not in the paper | Planned |
 
@@ -45,9 +46,28 @@ renderer applied to a scene with known density and colour, and the network and
 sample counts are far smaller than the paper's so that the run takes a couple
 of minutes on a laptop CPU.
 
+## Data
+
+The paper's synthetic Lego scene comes from the example archive that the
+authors' own download script fetches:
+
+```
+mkdir -p data
+curl -L -o data/nerf_example_data.zip http://cseweb.ucsd.edu/~viscomp/projects/LF/papers/ECCV20/nerf/nerf_example_data.zip
+unzip -q data/nerf_example_data.zip -d data
+python scripts/01_check_dataset.py data/nerf_synthetic/lego
+```
+
+The last command trains nothing. It checks that the dataset's cameras mean
+what this code assumes: that every camera looks at the origin down its own -z
+axis with world +z up, and that carving a grid with the silhouettes of all
+training views leaves a visual hull which projects back onto those
+silhouettes. It writes its numbers to `results/dataset_check.json`.
+
 ## What is here
 
-- `src/nerf/rays.py`: one ray per pixel from a camera pose.
+- `src/nerf/rays.py`: the camera model. One ray per pixel from a camera pose,
+  and the reverse, from a 3D point to the pixel it appears at.
 - `src/nerf/encoding.py`: positional encoding of positions and directions.
 - `src/nerf/model.py`: the network, from position and viewing direction to
   density and colour.
@@ -55,12 +75,15 @@ of minutes on a laptop CPU.
   rendering integral, importance sampling from the coarse weights, the
   two-pass coarse-then-fine rendering of a batch of rays, and rendering of
   whole images.
-- `src/nerf/data.py`: the container for posed images, camera pose helpers and
-  the analytic sphere scene.
+- `src/nerf/data.py`: the container for posed images, the loader for the
+  paper's synthetic scenes, camera pose helpers and the analytic sphere scene.
 - `src/nerf/train.py`: the training loop, its hyperparameters and evaluation
   by PSNR.
+- `src/nerf/hull.py`: space carving. The visual hull of a scene from its
+  silhouettes, used to check cameras without training.
 - `scripts/00_smoke_test.py`: the end-to-end run described above.
-- `tests/`: unit tests for the six modules.
+- `scripts/01_check_dataset.py`: the dataset check described above.
+- `tests/`: unit tests for the seven modules.
 
 ## How it is checked
 
@@ -104,6 +127,19 @@ so the right answer is known:
   evaluation code gives back the training images, which ties together the
   poses, focal length, bounds and background used at evaluation time;
 - the loss falls over a short run.
+
+**Data and cameras.**
+
+- a scene written to disk in the dataset's format is read back exactly:
+  poses, focal length, straight-alpha compositing over white, and
+  area-averaged downscaling done on RGBA before compositing;
+- a point on the ray through a pixel projects back to that pixel;
+- on the analytic scene the visual hull contains the interior of every sphere
+  and projects back onto the silhouettes with an intersection over union
+  above 0.95 in every view;
+- deliberately wrong cameras are caught: inverted poses or OpenCV-style axes
+  leave an empty hull, and mirrored or upside-down images drop the
+  intersection over union below 0.8.
 
 ## Where this follows the released code and not the paper
 

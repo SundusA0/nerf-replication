@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from nerf.rays import get_rays
+from nerf.rays import get_rays, project_points
 
 H, W, FOCAL = 6, 8, 10.0
 
@@ -72,3 +72,31 @@ def test_accepts_3x4_pose():
     full = get_rays(H, W, FOCAL, c2w)
     cropped = get_rays(H, W, FOCAL, c2w[:3])
     assert torch.allclose(full[0], cropped[0]) and torch.allclose(full[1], cropped[1])
+
+
+def test_project_points_inverts_get_rays():
+    # Any point on the ray through pixel (row, col) must project back to
+    # (row, col), at a depth equal to its ray parameter.
+    torch.manual_seed(0)
+    rotation, _ = torch.linalg.qr(torch.randn(3, 3, dtype=torch.float64))
+    if torch.linalg.det(rotation) < 0:
+        rotation[:, 0] *= -1
+    c2w = torch.eye(4, dtype=torch.float64)
+    c2w[:3, :3] = rotation
+    c2w[:3, 3] = torch.tensor([0.3, -1.2, 2.0], dtype=torch.float64)
+
+    origins, directions = get_rays(H, W, FOCAL, c2w)
+    expected_cols = torch.arange(W, dtype=torch.float64).expand(H, W)
+    expected_rows = torch.arange(H, dtype=torch.float64)[:, None].expand(H, W)
+    for t in (0.5, 3.0):
+        cols, rows, depth = project_points(origins + t * directions, H, W, FOCAL, c2w)
+        assert torch.allclose(cols, expected_cols, atol=1e-9)
+        assert torch.allclose(rows, expected_rows, atol=1e-9)
+        assert torch.allclose(depth, torch.full_like(depth, t))
+
+
+def test_points_behind_the_camera_have_negative_depth():
+    c2w = torch.eye(4, dtype=torch.float64)
+    points = torch.tensor([[0.0, 0.0, -2.0], [0.0, 0.0, 2.0]], dtype=torch.float64)
+    _, _, depth = project_points(points, H, W, FOCAL, c2w)
+    assert depth.tolist() == [2.0, -2.0]
