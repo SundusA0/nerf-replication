@@ -1,4 +1,4 @@
-"""Sampling along rays and volume rendering (Mildenhall et al. 2020, Section 4).
+"""Sampling along rays and volume rendering (Mildenhall et al. 2020, Sections 4 and 5.2).
 
 The colour seen along a ray r(t) = o + t d is the emission-absorption integral
 
@@ -13,7 +13,12 @@ emission-absorption special case of radiative transfer.
 
 Nothing in this module is learned. It turns densities and colours sampled
 along rays into pixels, and it is differentiable, which is what lets a network
-be trained through it later.
+be trained through it.
+
+  stratified_samples   where to sample a ray at first             (Eq. 2)
+  volume_render        samples -> pixel colour, depth, weights    (Eq. 3)
+  sample_pdf           where to sample again, given the weights   (Section 5.2)
+  render_rays          the two-pass procedure that combines them
 """
 
 from __future__ import annotations
@@ -132,3 +137,146 @@ def volume_render(
     if white_background:
         rgb_map = rgb_map + (1.0 - acc[..., None])
     return RenderOutput(rgb=rgb_map, depth=depth, acc=acc, weights=weights)
+
+
+def sample_pdf(
+    bins: torch.Tensor,
+    weights: torch.Tensor,
+    num_samples: int,
+    deterministic: bool = False,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Draw samples from a piecewise-constant distribution (Section 5.2).
+
+    `weights` gives the unnormalised probability of each bin and the density
+    is uniform inside a bin. Sampling is by inverse transform: build the
+    cumulative distribution F at the bin edges, draw u uniformly in [0, 1),
+    find the bin where F crosses u and interpolate linearly inside it.
+
+    Args:
+        bins: (R, M + 1) sorted bin edges.
+        weights: (R, M) non-negative weight of each bin.
+        num_samples: number of samples per ray.
+        deterministic: use evenly spaced u instead of random u (evaluation).
+        generator: random generator; draws happen on the CPU, as in
+            `stratified_samples`.
+
+    Returns:
+        (R, num_samples) samples in [bins[:, 0], bins[:, -1]]. Sorted only if
+        deterministic.
+    """
+    # A small floor on every bin avoids 0 / 0 on rays where all weights vanish
+    # (empty space); such rays are then sampled uniformly.
+    weights = weights + 1e-5
+    pdf = weights / weights.sum(dim=-1, keepdim=True)
+    cdf = torch.cumsum(pdf, dim=-1)
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)  # (R, M + 1)
+
+    num_rays = cdf.shape[0]
+    if deterministic:
+        u = torch.linspace(0.0, 1.0, num_samples, dtype=cdf.dtype, device=cdf.device)
+        u = u.expand(num_rays, num_samples)
+    else:
+        u = torch.rand(num_rays, num_samples, generator=generator, dtype=cdf.dtype)
+        u = u.to(cdf.device)
+    u = u.contiguous()
+
+    # Index of the first edge whose cdf exceeds u; the sample lies in the bin
+    # between the edge before it and that edge.
+    above = torch.searchsorted(cdf, u, right=True)
+    below = (above - 1).clamp(min=0)
+    above = above.clamp(max=cdf.shape[-1] - 1)
+
+    cdf_below, cdf_above = cdf.gather(-1, below), cdf.gather(-1, above)
+    bin_below, bin_above = bins.gather(-1, below), bins.gather(-1, above)
+
+    width = cdf_above - cdf_below
+    width = torch.where(width < 1e-5, torch.ones_like(width), width)
+    fraction = (u - cdf_below) / width
+    return bin_below + fraction * (bin_above - bin_below)
+
+
+class HierarchicalOutput(NamedTuple):
+    coarse: RenderOutput          # rendered from the coarse samples only
+    fine: RenderOutput | None     # rendered from coarse + importance samples
+    t_coarse: torch.Tensor        # (R, N_c) coarse sample positions
+    t_fine: torch.Tensor | None   # (R, N_c + N_f) all positions used by the fine pass
+
+
+def _query_and_render(model, rays_o, rays_d, view_dirs, t_vals, white_background):
+    points = rays_o[:, None, :] + t_vals[..., None] * rays_d[:, None, :]  # (R, N, 3)
+    dirs = view_dirs[:, None, :].expand_as(points)
+    sigma, rgb = model(points, dirs)
+    return volume_render(sigma, rgb, t_vals, rays_d, white_background)
+
+
+def render_rays(
+    coarse_model,
+    fine_model,
+    rays_o: torch.Tensor,
+    rays_d: torch.Tensor,
+    near: float,
+    far: float,
+    num_coarse: int,
+    num_fine: int,
+    perturb: bool = True,
+    white_background: bool = False,
+    generator: torch.Generator | None = None,
+) -> HierarchicalOutput:
+    """Render a batch of rays with hierarchical sampling (Section 5.2).
+
+    Most of a ray passes through empty space or lies behind a surface, so
+    evenly spread samples are mostly wasted. NeRF therefore samples twice:
+
+      1. Coarse pass. Query `coarse_model` at `num_coarse` stratified samples
+         and render. The weights w_i say where along the ray the visible
+         content is.
+      2. Fine pass. Normalise those weights into a probability distribution,
+         draw `num_fine` more samples from it, and query `fine_model` at the
+         union of both sets of samples, sorted.
+
+    Both renders are returned because both are used in the loss (Eq. 6): the
+    coarse network has to be trained too, or its weights would be useless for
+    placing the fine samples.
+
+    As in the released code, the distribution is built on the midpoints
+    between coarse samples and uses the weights of the interior samples only.
+    The importance samples are treated as constants: no gradient flows from
+    the fine render back into the coarse network through their positions.
+
+    Args:
+        coarse_model, fine_model: callables (points, view_dirs) -> (sigma, rgb)
+            with points and view_dirs of shape (R, N, 3). If `fine_model` is
+            None the coarse model is used for both passes.
+        rays_o, rays_d: (R, 3) ray origins and directions (see `get_rays`).
+        near, far: bounds on the ray parameter.
+        num_coarse: N_c, 64 in the paper.
+        num_fine: N_f, 128 in the paper. 0 disables the fine pass.
+        perturb: random sample positions (training) or fixed ones (evaluation).
+        white_background: composite over white.
+        generator: random generator for reproducible sampling.
+    """
+    view_dirs = rays_d / rays_d.norm(dim=-1, keepdim=True)
+
+    t_coarse = stratified_samples(
+        near, far, rays_o.shape[0], num_coarse,
+        perturb=perturb, generator=generator, device=rays_o.device, dtype=rays_o.dtype,
+    )
+    coarse = _query_and_render(
+        coarse_model, rays_o, rays_d, view_dirs, t_coarse, white_background
+    )
+    if num_fine == 0:
+        return HierarchicalOutput(coarse=coarse, fine=None, t_coarse=t_coarse, t_fine=None)
+
+    t_mid = 0.5 * (t_coarse[:, 1:] + t_coarse[:, :-1])
+    t_importance = sample_pdf(
+        t_mid, coarse.weights[:, 1:-1], num_fine,
+        deterministic=not perturb, generator=generator,
+    ).detach()
+    t_fine, _ = torch.sort(torch.cat([t_coarse, t_importance], dim=-1), dim=-1)
+
+    fine = _query_and_render(
+        fine_model if fine_model is not None else coarse_model,
+        rays_o, rays_d, view_dirs, t_fine, white_background,
+    )
+    return HierarchicalOutput(coarse=coarse, fine=fine, t_coarse=t_coarse, t_fine=t_fine)
