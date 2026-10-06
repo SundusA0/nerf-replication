@@ -19,6 +19,7 @@ be trained through it.
   volume_render        samples -> pixel colour, depth, weights    (Eq. 3)
   sample_pdf           where to sample again, given the weights   (Section 5.2)
   render_rays          the two-pass procedure that combines them
+  render_image         render_rays over every pixel of one camera
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+
+from nerf.rays import get_rays
 
 
 class RenderOutput(NamedTuple):
@@ -280,3 +283,54 @@ def render_rays(
         rays_o, rays_d, view_dirs, t_fine, white_background,
     )
     return HierarchicalOutput(coarse=coarse, fine=fine, t_coarse=t_coarse, t_fine=t_fine)
+
+
+class ImageOutput(NamedTuple):
+    rgb: torch.Tensor    # (H, W, 3)
+    depth: torch.Tensor  # (H, W)
+    acc: torch.Tensor    # (H, W)
+
+
+@torch.no_grad()
+def render_image(
+    coarse_model,
+    fine_model,
+    height: int,
+    width: int,
+    focal: float,
+    c2w: torch.Tensor,
+    near: float,
+    far: float,
+    num_coarse: int,
+    num_fine: int,
+    white_background: bool = False,
+    chunk: int = 4096,
+) -> ImageOutput:
+    """Render a full image from one camera, for evaluation.
+
+    Sample positions are fixed (no jitter) and no gradients are kept. An image
+    has far more rays than fit through the network at once, so they are
+    rendered `chunk` rays at a time. The result comes from the fine pass, or
+    from the coarse pass if `num_fine` is 0.
+    """
+    rays_o, rays_d = get_rays(height, width, focal, c2w)
+    rays_o, rays_d = rays_o.reshape(-1, 3), rays_d.reshape(-1, 3)
+
+    rgb, depth, acc = [], [], []
+    for start in range(0, rays_o.shape[0], chunk):
+        out = render_rays(
+            coarse_model, fine_model,
+            rays_o[start : start + chunk], rays_d[start : start + chunk],
+            near, far, num_coarse, num_fine,
+            perturb=False, white_background=white_background,
+        )
+        final = out.fine if out.fine is not None else out.coarse
+        rgb.append(final.rgb)
+        depth.append(final.depth)
+        acc.append(final.acc)
+
+    return ImageOutput(
+        rgb=torch.cat(rgb).reshape(height, width, 3),
+        depth=torch.cat(depth).reshape(height, width),
+        acc=torch.cat(acc).reshape(height, width),
+    )

@@ -1,0 +1,17 @@
+{
+  "iterations": 2000,
+  "seed": 0,
+  "device": "cpu",
+  "torch": "2.14.1",
+  "machine": "arm64",
+  "train_seconds": 39.9,
+  "psnr_blank_image": 8.49,
+  "psnr_held_out_views": [
+    23.82,
+    25.72,
+    24.16,
+    24.59
+  ],
+  "psnr_held_out_mean": 24.57,
+  "psnr_required": 20.0
+}

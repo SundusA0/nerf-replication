@@ -7,7 +7,7 @@ name = "nerf-replication"
 version = "0.1.0"
 description = "From-scratch PyTorch replication of NeRF (Mildenhall et al., 2020)"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.2", "numpy>=1.26"]
+dependencies = ["torch>=2.2", "numpy>=1.26", "pillow>=10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

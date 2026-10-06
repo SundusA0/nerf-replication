@@ -3,7 +3,14 @@ import math
 import torch
 
 from nerf.model import NeRF
-from nerf.render import render_rays, sample_pdf, stratified_samples, volume_render
+from nerf.rays import get_rays
+from nerf.render import (
+    render_image,
+    render_rays,
+    sample_pdf,
+    stratified_samples,
+    volume_render,
+)
 
 F64 = torch.float64
 NEAR, FAR = 2.0, 6.0
@@ -419,3 +426,61 @@ def test_training_mode_randomises_the_importance_samples():
 
     assert spacing_irregularity(perturb=False) < 0.05
     assert spacing_irregularity(perturb=True) > 0.3
+
+
+# --------------------------------------------------------------------------
+# Whole images
+# --------------------------------------------------------------------------
+
+
+def camera_facing_wall():
+    c2w = torch.eye(4, dtype=F64)
+    c2w[2, 3] = 4.0  # at z = 4, looking down -z
+    return c2w
+
+
+def test_render_image_matches_render_rays_whatever_the_chunk_size():
+    height, width, focal = 6, 8, 10.0
+    c2w = camera_facing_wall()
+    whole = render_image(wall, wall, height, width, focal, c2w, NEAR, FAR, 16, 32, chunk=10_000)
+    pieces = render_image(wall, wall, height, width, focal, c2w, NEAR, FAR, 16, 32, chunk=7)
+
+    assert whole.rgb.shape == (height, width, 3)
+    assert whole.depth.shape == whole.acc.shape == (height, width)
+    assert torch.equal(whole.rgb, pieces.rgb)
+    assert torch.equal(whole.depth, pieces.depth)
+    assert torch.equal(whole.acc, pieces.acc)
+
+    origins, directions = get_rays(height, width, focal, c2w)
+    direct = render_rays(
+        wall, wall, origins.reshape(-1, 3), directions.reshape(-1, 3),
+        NEAR, FAR, 16, 32, perturb=False,
+    )
+    assert torch.equal(whole.rgb, direct.fine.rgb.reshape(height, width, 3))
+
+
+def test_render_image_sees_the_wall_at_the_right_depth():
+    out = render_image(wall, wall, 6, 8, 10.0, camera_facing_wall(), NEAR, FAR, 64, 64)
+    # t is depth in front of the camera, so a flat wall has the same t in
+    # every pixel, not only along the central ray.
+    assert torch.allclose(out.depth, torch.full_like(out.depth, 4.0 - WALL_Z), atol=0.05)
+    assert torch.allclose(out.acc, torch.ones_like(out.acc), atol=1e-4)
+
+
+def test_render_image_without_fine_pass_returns_the_coarse_render():
+    height, width, focal = 4, 4, 10.0
+    c2w = camera_facing_wall()
+    out = render_image(wall, None, height, width, focal, c2w, NEAR, FAR, 16, 0)
+    origins, directions = get_rays(height, width, focal, c2w)
+    direct = render_rays(
+        wall, None, origins.reshape(-1, 3), directions.reshape(-1, 3),
+        NEAR, FAR, 16, 0, perturb=False,
+    )
+    assert torch.equal(out.rgb, direct.coarse.rgb.reshape(height, width, 3))
+
+
+def test_render_image_keeps_no_gradients():
+    torch.manual_seed(0)
+    model = NeRF(depth=2, width=16, skip=0)
+    out = render_image(model, model, 4, 4, 5.0, torch.eye(4), NEAR, FAR, 8, 8)
+    assert not out.rgb.requires_grad
