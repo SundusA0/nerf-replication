@@ -12,8 +12,10 @@ published ones.
 
 In progress. The pipeline trains end to end on a small synthetic scene, and
 a first short run on the paper's Lego scene at 1/8 resolution reaches 22.5 dB
-on a held-out view after 2,000 steps on a laptop GPU. The full-resolution run
-has not been done yet, so there is nothing to compare with the paper.
+on a held-out view after 2,000 steps on a laptop GPU. The same training runs
+as an Amazon SageMaker job, where it reproduces the laptop's loss. The
+full-resolution run has not finished yet, so there is nothing to compare with
+the paper.
 
 | Part | Paper | Status |
 | --- | --- | --- |
@@ -26,7 +28,7 @@ has not been done yet, so there is nothing to compare with the paper.
 | Training loop | Section 5.3, Eq. 6 | Implemented, tested on an analytic scene |
 | Loader for the paper's synthetic scenes, and a camera check | Section 6.1 | Implemented, tested; Lego passes |
 | Training script with checkpoints and exact resume | | Implemented, tested |
-| Launcher for Amazon SageMaker training jobs | | Implemented, tested offline; no job run yet |
+| Launcher for Amazon SageMaker training jobs | | Implemented, tested; CPU jobs run on AWS, GPU run pending |
 | Lego scene: PSNR, SSIM, LPIPS against the paper | Section 6 | Next |
 | Mesh extraction from the trained density | not in the paper | Planned |
 
@@ -142,7 +144,63 @@ policy lets the job read and write objects only in buckets named that way.
 The launcher itself needs `boto3` and AWS credentials but not PyTorch. AWS
 CloudShell, the terminal in the AWS console, has both.
 
-No job has been run on AWS yet. The measured speed and cost will go here.
+#### First jobs on AWS
+
+Two jobs have run so far, both on a CPU machine (`ml.m5.xlarge`), on the Lego
+scene at 1/8 resolution with the paper's network and sampling:
+
+```
+python3 scripts/03_sagemaker.py launch benchmark --instance-type ml.m5.xlarge --run lego-100px-cpu --iterations 100 --extra="--downscale 8 --log-every 10"
+python3 scripts/03_sagemaker.py launch benchmark --instance-type ml.m5.xlarge --run lego-100px-cpu --iterations 120 --extra="--downscale 8 --log-every 10"
+```
+
+The first trained 100 steps and left its run directory in S3. The second was
+launched under the same run name, so SageMaker restored that directory and the
+script continued from step 100. This is the launcher's output from the moment
+that job started, with the account number removed:
+
+```
+Started job nerf-lego-100px-cpu-20261007-184016
+  machine     ml.m5.xlarge, stopped automatically after 45 min
+  program     python3 -u 02_train.py /opt/ml/input/data/training --out /opt/ml/checkpoints --iterations 120 --validate-every 1000 --checkpoint-every 500 --device cpu --downscale 8 --log-every 10
+  results     s3://sagemaker-us-east-1-<account>/nerf/runs/lego-100px-cpu/out
+  to stop it  python3 /home/cloudshell-user/nerf-replication/scripts/03_sagemaker.py stop
+Following the job. Control-C stops following; the job itself keeps running.
+[18:40:17 UTC] Starting: Starting the training job
+[18:40:17 UTC] Starting: Preparing the instances for training
+[18:42:58 UTC] Downloading: Downloading input data
+[18:42:58 UTC] Downloading: Downloading the training image
+[18:44:14 UTC] Training: Training image download completed. Training in progress.
+100 training views at 100 x 100, 4 validation views, device cpu, torch 2.10.0+cpu
+resumed from /opt/ml/checkpoints/checkpoint.pt at step 100
+step     110  loss 0.05518  train PSNR 15.67 dB    0.12 steps/s  about 1.4 min left
+step     120  loss 0.05505  train PSNR 15.94 dB    0.12 steps/s  about 0.0 min left
+step     120  validation PSNR 16.54 dB  -> val_000120.png
+finished at step 120: mean PSNR on 4 validation views 16.03 dB, 20.4 min of training in total
+results are in /opt/ml/checkpoints
+[18:50:16 UTC] Uploading: Uploading generated training model
+[18:50:19 UTC] Completed: Training job completed
+
+job      nerf-lego-100px-cpu-20261007-184016
+status   Completed (Completed)
+machine  ml.m5.xlarge, time limit 45 min
+billed   7.3 min
+results  s3://sagemaker-us-east-1-<account>/nerf/runs/lego-100px-cpu/out
+```
+
+The job on AWS computes the same thing as a local run. With the same seed, at
+step 100:
+
+| | Laptop GPU (MPS, PyTorch 2.14.1) | SageMaker `ml.m5.xlarge` (CPU, PyTorch 2.10.0) |
+| --- | --- | --- |
+| Loss | 0.05542 | 0.05530 |
+| Train PSNR | 16.05 dB | 16.07 dB |
+| Steps per second | 1.34 | 0.12 |
+
+The two jobs were billed 19.4 and 7.3 minutes. A CPU machine runs at about a
+tenth of the laptop's speed, so these jobs show only that the pipeline works
+on AWS. The full-resolution run needs a GPU instance, and the account's quota
+for one has been requested.
 
 ## What is here
 
@@ -243,6 +301,9 @@ so the right answer is known:
 - the launcher is run against canned AWS responses: it reports every missing
   piece of the setup, refuses to start a second job of a run that is still
   active, and when following a job prints each log line once.
+
+What those tests cannot show is that AWS accepts the job and that a later job
+gets the run directory back. The two jobs described under Training show both.
 
 ## Where this follows the released code and not the paper
 
