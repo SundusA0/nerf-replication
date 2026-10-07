@@ -10,9 +10,10 @@ published ones.
 
 ## Status
 
-In progress. The pipeline now trains end to end on a small synthetic scene.
-It has not been trained on the paper's data yet, so there is nothing to
-compare with the paper.
+In progress. The pipeline trains end to end on a small synthetic scene, and
+a first short run on the paper's Lego scene at 1/8 resolution reaches 22.5 dB
+on a held-out view after 2,000 steps on a laptop GPU. The full-resolution run
+has not been done yet, so there is nothing to compare with the paper.
 
 | Part | Paper | Status |
 | --- | --- | --- |
@@ -25,6 +26,7 @@ compare with the paper.
 | Training loop | Section 5.3, Eq. 6 | Implemented, tested on an analytic scene |
 | Loader for the paper's synthetic scenes, and a camera check | Section 6.1 | Implemented, tested; Lego passes |
 | Training script with checkpoints and exact resume | | Implemented, tested |
+| Launcher for Amazon SageMaker training jobs | | Implemented, tested offline; no job run yet |
 | Lego scene: PSNR, SSIM, LPIPS against the paper | Section 6 | Next |
 | Mesh extraction from the trained density | not in the paper | Planned |
 
@@ -87,6 +89,61 @@ termination signal of a job scheduler) lets the current step finish and saves
 first, so an interrupted run follows exactly the same path as an uninterrupted
 one. Run directories are not committed.
 
+### As an Amazon SageMaker training job
+
+At about 1.4 steps per second on a laptop GPU, 500k steps take four days.
+`scripts/03_sagemaker.py` runs the same script on a rented GPU machine:
+
+```
+python3 scripts/03_sagemaker.py launch benchmark
+python3 scripts/03_sagemaker.py launch full --max-hours 24
+python3 scripts/03_sagemaker.py status
+python3 scripts/03_sagemaker.py stop
+```
+
+`benchmark` is the first 2,000 steps of the paper configuration, to see that
+the job runs and how fast. `full` is all 500k steps. The job is described in
+`src/nerf/sagemaker.py`:
+
+- **Container.** AWS's prebuilt PyTorch 2.10 training image. Nothing is
+  installed when the job starts.
+- **Program.** `python3 -u 02_train.py` with the same arguments as a local
+  run, plus `--device cuda`, so that a job which cannot see its GPU fails at
+  once.
+- **Code.** The script and the `nerf` package are uploaded to S3 for each job
+  and mounted as an input channel. The script sits next to the package, so
+  nothing has to be installed. The upload is the record of what the job ran,
+  and the job is tagged with the git commit.
+- **Data.** The scene directory in S3 is a second input channel.
+- **Run directory.** The script's `--out` directory is the job's checkpoint
+  directory, which SageMaker copies to S3 while the job runs and restores when
+  a later job names the same location. Jobs with the same `--run` name
+  therefore continue one another: `full` picks up where `benchmark` ended, and
+  a job that was stopped or reached its time limit is continued by launching
+  it again.
+- **Cost limit.** Every job has a time limit, after which SageMaker stops it.
+  The stop signal reaches the script directly, which finishes its step and
+  saves a checkpoint.
+
+One-time setup, in region us-east-1, from a machine with the AWS CLI and the
+scene:
+
+```
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET=sagemaker-us-east-1-$ACCOUNT
+aws s3 mb s3://$BUCKET --region us-east-1
+aws s3 sync data/nerf_synthetic/lego s3://$BUCKET/nerf/data/lego --only-show-errors
+aws iam create-role --role-name nerf-sagemaker-role --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sagemaker.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name nerf-sagemaker-role --policy-arn arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+```
+
+The bucket name has to contain "sagemaker": the `AmazonSageMakerFullAccess`
+policy lets the job read and write objects only in buckets named that way.
+The launcher itself needs `boto3` and AWS credentials but not PyTorch. AWS
+CloudShell, the terminal in the AWS console, has both.
+
+No job has been run on AWS yet. The measured speed and cost will go here.
+
 ## What is here
 
 - `src/nerf/rays.py`: the camera model. One ray per pixel from a camera pose,
@@ -107,7 +164,11 @@ one. Run directories are not committed.
 - `scripts/00_smoke_test.py`: the end-to-end run described above.
 - `scripts/01_check_dataset.py`: the dataset check described above.
 - `scripts/02_train.py`: training on a synthetic scene, as described above.
-- `tests/`: unit tests for the seven modules.
+- `src/nerf/sagemaker.py`: the description of a SageMaker training job for
+  that script. It makes no AWS calls.
+- `scripts/03_sagemaker.py`: uploads the code, starts the job, follows its
+  log, stops it.
+- `tests/`: unit tests for the eight modules and the launcher.
 
 ## How it is checked
 
@@ -169,6 +230,19 @@ so the right answer is known:
 - deliberately wrong cameras are caught: inverted poses or OpenCV-style axes
   leave an empty hull, and mirrored or upside-down images drop the
   intersection over union below 0.8.
+
+**SageMaker job.** These run without an AWS account:
+
+- the request satisfies every length, range, pattern and enumeration rule in
+  the description of the API that ships with the AWS SDK. The SDK itself
+  checks only types and required fields before sending;
+- the job's exact command line, run on a copy of the uploaded files in an
+  empty directory, trains, and run again with a larger step count it continues
+  from the checkpoint. A marker written on import shows that the uploaded
+  package was the one used;
+- the launcher is run against canned AWS responses: it reports every missing
+  piece of the setup, refuses to start a second job of a run that is still
+  active, and when following a job prints each log line once.
 
 ## Where this follows the released code and not the paper
 
