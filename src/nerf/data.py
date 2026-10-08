@@ -53,7 +53,23 @@ class Views:
         )
 
 
-def load_blender(scene_dir, split: str = "train", downscale: int = 1, skip: int = 1) -> Views:
+def blender_frames(scene_dir, split: str = "train") -> list[str]:
+    """The image paths of one split of a NeRF synthetic scene, in file order.
+
+    The paths are as written in the dataset, relative to the scene directory
+    and without the ".png", e.g. "./test/r_0".
+    """
+    meta = json.loads((Path(scene_dir) / f"transforms_{split}.json").read_text())
+    return [frame["file_path"] for frame in meta["frames"]]
+
+
+def load_blender(
+    scene_dir,
+    split: str = "train",
+    downscale: int = 1,
+    skip: int = 1,
+    indices=None,
+) -> Views:
     """Read one split of a NeRF synthetic ("Blender") scene such as Lego.
 
     A scene directory holds `transforms_{train,val,test}.json` and the images
@@ -73,12 +89,18 @@ def load_blender(scene_dir, split: str = "train", downscale: int = 1, skip: int 
         downscale: integer factor to shrink the images by; 2 gives the
             400x400 "half resolution" of the released example config.
         skip: keep every `skip`-th frame, to evaluate on a subset.
+        indices: of the frames that `skip` keeps, load only those at these
+            positions. This reads a large split a few views at a time: the
+            200 test views at full resolution take several GB at once.
     """
     scene_dir = Path(scene_dir)
     meta = json.loads((scene_dir / f"transforms_{split}.json").read_text())
+    frames = meta["frames"][::skip]
+    if indices is not None:
+        frames = [frames[index] for index in indices]
 
     images, poses = [], []
-    for frame in meta["frames"][::skip]:
+    for frame in frames:
         image = Image.open(scene_dir / (frame["file_path"] + ".png")).convert("RGBA")
         images.append(torch.from_numpy(np.asarray(image, dtype=np.float32) / 255.0))
         poses.append(torch.tensor(frame["transform_matrix"], dtype=torch.float32))

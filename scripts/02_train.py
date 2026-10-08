@@ -5,12 +5,13 @@
 The defaults are the released paper configuration (`nerf.train.TrainConfig`)
 at full resolution. Everything the run produces goes into the --out directory:
 
-    config.json       the settings of the run
-    log.csv           step, loss, train PSNR, learning rate, steps per second
-    validation.csv    step and PSNR on one held-out view
-    val_<step>.png    that view: truth on the left, render on the right
-    checkpoint.pt     the latest state
-    summary.json      written when the run reaches its last step
+    config.json            the settings of the run
+    log.csv                step, loss, train PSNR, learning rate, steps per second
+    validation.csv         step and PSNR on one held-out view
+    val_<step>.png         that view: truth on the left, render on the right
+    checkpoint.pt          the latest state, overwritten as the run goes on
+    checkpoint_<step>.pt   the state at every --keep-every-th step, kept
+    summary.json           written when the run reaches its last step
 
 Running the same command again resumes from checkpoint.pt. A run can therefore
 be stopped and continued, or extended by raising --iterations. Ctrl-C (or a
@@ -33,6 +34,7 @@ import torch
 from PIL import Image
 
 from nerf.data import load_blender
+from nerf.metrics import psnr
 from nerf.render import render_image
 from nerf.train import (
     TrainConfig,
@@ -40,22 +42,12 @@ from nerf.train import (
     TrainResult,
     evaluate,
     load_checkpoint,
-    psnr,
+    pick_device,
     save_checkpoint,
 )
 
 LOG_COLUMNS = ["step", "loss", "train_psnr", "lr", "steps_per_second", "seconds"]
 VALIDATION_COLUMNS = ["step", "psnr", "seconds"]
-
-
-def pick_device(name: str) -> str:
-    if name != "auto":
-        return name
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def start_table(path: Path, columns: list[str], keep_up_to: int) -> None:
@@ -105,6 +97,8 @@ def main() -> int:
     parser.add_argument("--log-every", type=int, default=defaults.log_every)
     parser.add_argument("--validate-every", type=int, default=1000)
     parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument("--keep-every", type=int, default=50_000,
+                        help="also keep the checkpoint under a name of its own every n steps (0: never)")
     parser.add_argument("--val-skip", type=int, default=25, help="use every n-th validation view")
     args = parser.parse_args()
 
@@ -118,13 +112,23 @@ def main() -> int:
     device = pick_device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
 
+    # The image size is not among the settings the checkpoint carries, so it
+    # is compared here: a run is continued on the images it was started on.
+    checkpoint, config_file = args.out / "checkpoint.pt", args.out / "config.json"
+    if checkpoint.exists() and config_file.exists():
+        trained_with = json.loads(config_file.read_text()).get("downscale", args.downscale)
+        if trained_with != args.downscale:
+            print(f"{args.out} already holds a run, trained with --downscale {trained_with}, "
+                  f"not {args.downscale}.")
+            print("Use another --out directory for a run with new settings.")
+            return 2
+
     train_views = load_blender(args.scene_dir, "train", args.downscale)
     val_views = load_blender(args.scene_dir, "val", args.downscale, skip=args.val_skip).to(device)
     print(f"{len(train_views)} training views at {train_views.width} x {train_views.height}, "
           f"{len(val_views)} validation views, device {device}, torch {torch.__version__}")
 
     trainer = Trainer(train_views, config, device)
-    checkpoint = args.out / "checkpoint.pt"
     elapsed_before = 0.0
     if checkpoint.exists():
         try:
@@ -138,7 +142,7 @@ def main() -> int:
     start_table(args.out / "validation.csv", VALIDATION_COLUMNS, trainer.step_count)
     settings = {**asdict(config), "scene": str(args.scene_dir), "downscale": args.downscale,
                 "device": device, "torch": torch.__version__}
-    (args.out / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
+    config_file.write_text(json.dumps(settings, indent=2) + "\n")
 
     session_start = time.time()
 
@@ -188,6 +192,12 @@ def main() -> int:
                   f"{rate:6.2f} steps/s  about {remaining / 60:.1f} min left")
         if step % args.validate_every == 0 or last:
             validate(step)
+        if args.keep_every > 0 and step % args.keep_every == 0:
+            # checkpoint.pt is overwritten as the run goes on. These stay, so
+            # the run can be scored later at several points of its training.
+            # Written first: a run killed between the two saves then passes
+            # this step again and does not end up without the kept file.
+            save_checkpoint(args.out / f"checkpoint_{step:06d}.pt", trainer, extra={"elapsed": elapsed()})
         if step % args.checkpoint_every == 0 or last:
             save_checkpoint(checkpoint, trainer, extra={"elapsed": elapsed()})
 

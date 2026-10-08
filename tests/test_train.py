@@ -6,7 +6,7 @@ import torch
 
 import nerf.train
 from nerf.data import SphereScene, Views, analytic_views
-from nerf.render import render_rays
+from nerf.render import render_image, render_rays
 from nerf.train import (
     TrainConfig,
     Trainer,
@@ -14,7 +14,8 @@ from nerf.train import (
     evaluate,
     learning_rate_at,
     load_checkpoint,
-    psnr,
+    load_networks,
+    pick_device,
     sample_ray_batch,
     save_checkpoint,
     train,
@@ -56,11 +57,16 @@ def coordinate_views(height=6, width=10):
 # --------------------------------------------------------------------------
 
 
-def test_psnr_values():
-    target = torch.zeros(4, 4, 3)
-    assert math.isclose(psnr(target + 0.1, target), 20.0, abs_tol=1e-4)   # MSE 1e-2
-    assert math.isclose(psnr(target + 0.01, target), 40.0, abs_tol=1e-3)  # MSE 1e-4
-    assert psnr(target, target) == math.inf
+def test_pick_device_takes_a_named_device_or_the_best_available(monkeypatch):
+    available = {"cuda": False, "mps": False}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: available["cuda"])
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: available["mps"])
+    assert pick_device("auto") == "cpu"
+    available["mps"] = True
+    assert pick_device("auto") == "mps"
+    available["cuda"] = True
+    assert pick_device("auto") == "cuda"
+    assert pick_device("cpu") == "cpu"   # a named device is taken as given
 
 
 def test_defaults_are_the_released_paper_configuration():
@@ -327,3 +333,29 @@ def test_a_failed_save_leaves_the_previous_checkpoint_intact(tiny_views, tmp_pat
     with pytest.raises(KeyboardInterrupt):
         save_checkpoint(path, trainer)
     assert path.read_bytes() == before
+
+
+def test_load_networks_rebuilds_the_trained_networks_from_the_file_alone(tiny_views, tmp_path):
+    # Not the default network shape anywhere, so every setting has to come
+    # from the file.
+    config = tiny_config(depth=3, width=24, skip=1, num_freqs_pos=6, num_freqs_dir=2)
+    trainer = Trainer(tiny_views, config)
+    for _ in range(3):
+        trainer.step()
+    save_checkpoint(tmp_path / "checkpoint.pt", trainer)
+
+    loaded = load_networks(tmp_path / "checkpoint.pt")
+    assert loaded.step == 3
+    assert loaded.config == config
+    for original, restored in ((trainer.coarse, loaded.coarse), (trainer.fine, loaded.fine)):
+        for (name, a), b in zip(original.named_parameters(), restored.parameters()):
+            assert torch.equal(a, b), name
+    # the two networks differ, so the comparison above would notice a swap
+    assert not torch.equal(next(loaded.coarse.parameters()), next(loaded.fine.parameters()))
+
+    # and they render the same picture as the networks that were saved
+    camera = (16, 16, tiny_views.focal, tiny_views.poses[0], tiny_views.near, tiny_views.far)
+    samples = (config.num_coarse, config.num_fine)
+    before = render_image(trainer.coarse, trainer.fine, *camera, *samples, white_background=True).rgb
+    after = render_image(loaded.coarse, loaded.fine, *camera, *samples, white_background=True).rgb
+    assert torch.equal(before, after)

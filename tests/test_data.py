@@ -6,7 +6,14 @@ import pytest
 import torch
 from PIL import Image
 
-from nerf.data import SphereScene, analytic_views, load_blender, look_at, orbit_poses
+from nerf.data import (
+    SphereScene,
+    analytic_views,
+    blender_frames,
+    load_blender,
+    look_at,
+    orbit_poses,
+)
 from nerf.rays import get_rays
 
 
@@ -201,3 +208,29 @@ def test_load_blender_split_and_skip(tmp_path):
     every_other = load_blender(tmp_path, "train", skip=2)
     assert len(every_other) == 2
     assert torch.equal(every_other.poses, train.poses[::2])
+
+
+def test_frames_can_be_listed_and_loaded_one_at_a_time(tmp_path):
+    write_blender_scene(tmp_path, analytic_views(5, image_size=16, num_samples=32), "test")
+    assert blender_frames(tmp_path, "test") == [f"./test/r_{k}" for k in range(5)]
+
+    everything = load_blender(tmp_path, "test")
+    for index in range(5):
+        one = load_blender(tmp_path, "test", indices=[index])
+        assert len(one) == 1
+        assert torch.equal(one.images[0], everything.images[index])
+        assert torch.equal(one.poses[0], everything.poses[index])
+        assert torch.equal(one.alpha[0], everything.alpha[index])
+        assert one.focal == everything.focal
+    # the views differ from one another, so the right one was read each time
+    assert not torch.equal(everything.images[0], everything.images[1])
+
+    # any selection, in the order asked for
+    assert torch.equal(load_blender(tmp_path, "test", indices=[3, 1]).poses, everything.poses[[3, 1]])
+    # positions count the frames that `skip` keeps: 0, 2, 4
+    assert torch.equal(load_blender(tmp_path, "test", skip=2, indices=[1]).poses[0], everything.poses[2])
+    # and the other options still apply
+    half = load_blender(tmp_path, "test", downscale=2)
+    one_half = load_blender(tmp_path, "test", downscale=2, indices=[4])
+    assert torch.equal(one_half.images[0], half.images[4])
+    assert one_half.focal == half.focal

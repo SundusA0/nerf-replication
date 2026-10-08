@@ -22,6 +22,7 @@ from typing import NamedTuple
 import torch
 
 from nerf.data import Views
+from nerf.metrics import psnr
 from nerf.model import NeRF
 from nerf.rays import get_rays
 from nerf.render import render_image, render_rays
@@ -67,14 +68,15 @@ class TrainResult:
     history: list[dict] = field(default_factory=list)  # step, loss, psnr, lr, seconds
 
 
-def psnr(prediction: torch.Tensor, target: torch.Tensor) -> float:
-    """Peak signal-to-noise ratio in dB for colours in [0, 1]: -10 log10(MSE).
-
-    Higher is better, and every factor of 10 in the mean squared error is
-    10 dB. This is the main image-quality number the paper reports.
-    """
-    mse = torch.mean((prediction - target) ** 2).item()
-    return math.inf if mse == 0 else -10.0 * math.log10(mse)
+def pick_device(name: str = "auto") -> str:
+    """The device to compute on: the one named or, for "auto", the best available."""
+    if name != "auto":
+        return name
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def learning_rate_at(step: int, config: TrainConfig) -> float:
@@ -229,6 +231,33 @@ def load_checkpoint(path, trainer: Trainer) -> dict:
         raise ValueError(f"checkpoint was made with different settings: {changed}")
     trainer.load_state_dict(state)
     return state["extra"]
+
+
+class TrainedNetworks(NamedTuple):
+    coarse: NeRF
+    fine: NeRF
+    config: TrainConfig   # the settings they were trained with
+    step: int             # how many training steps they have had
+
+
+def load_networks(path, device: str = "cpu") -> TrainedNetworks:
+    """The two networks stored in a checkpoint, for rendering.
+
+    `load_checkpoint` restores a `Trainer`, which needs the training images.
+    This needs only the file: it rebuilds the networks from the settings saved
+    with them and leaves the optimiser and the random stream behind.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    config = TrainConfig(**state["config"])
+    networks = {}
+    for name in ("coarse", "fine"):
+        network = NeRF(
+            config.depth, config.width, config.skip,
+            config.num_freqs_pos, config.num_freqs_dir,
+        )
+        network.load_state_dict(state[name])
+        networks[name] = network.to(device)
+    return TrainedNetworks(networks["coarse"], networks["fine"], config, state["step"])
 
 
 def train(views: Views, config: TrainConfig, device: str = "cpu", log=print) -> TrainResult:

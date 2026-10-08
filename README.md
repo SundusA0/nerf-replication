@@ -13,9 +13,10 @@ published ones.
 In progress. The pipeline trains end to end on a small synthetic scene, and
 a first short run on the paper's Lego scene at 1/8 resolution reaches 22.5 dB
 on a held-out view after 2,000 steps on a laptop GPU. The same training runs
-as an Amazon SageMaker job, where it reproduces the laptop's loss. The
-full-resolution run has not finished yet, so there is nothing to compare with
-the paper.
+as an Amazon SageMaker job, where it reproduces the laptop's loss. The script
+that scores a trained model on the test views with the paper's three measures
+is written and tested. The full-resolution run has not finished yet, so there
+is nothing to compare with the paper.
 
 | Part | Paper | Status |
 | --- | --- | --- |
@@ -29,7 +30,8 @@ the paper.
 | Loader for the paper's synthetic scenes, and a camera check | Section 6.1 | Implemented, tested; Lego passes |
 | Training script with checkpoints and exact resume | | Implemented, tested |
 | Launcher for Amazon SageMaker training jobs | | Implemented, tested; CPU jobs run on AWS, GPU run pending |
-| Lego scene: PSNR, SSIM, LPIPS against the paper | Section 6 | Next |
+| PSNR, SSIM and LPIPS on the test views | Section 6 | Implemented, tested |
+| Lego at full resolution: scores against the paper | Table 4 | Next |
 | Mesh extraction from the trained density | not in the paper | Planned |
 
 ## First trained result
@@ -89,7 +91,9 @@ a validation image and PSNR at intervals, and a checkpoint. Running the same
 command again resumes from the checkpoint, and a stop request (Ctrl-C, or the
 termination signal of a job scheduler) lets the current step finish and saves
 first, so an interrupted run follows exactly the same path as an uninterrupted
-one. Run directories are not committed.
+one. Every 50,000 steps the checkpoint is also kept under a name of its own
+(`--keep-every`), so that the run can be scored afterwards at several points
+of its training. Run directories are not committed.
 
 ### As an Amazon SageMaker training job
 
@@ -202,6 +206,51 @@ tenth of the laptop's speed, so these jobs show only that the pipeline works
 on AWS. The full-resolution run needs a GPU instance, and the account's quota
 for one has been requested.
 
+## Evaluation
+
+```
+python scripts/04_evaluate.py data/nerf_synthetic/lego runs/lego_800px/checkpoint.pt
+```
+
+This renders the scene's test views, which training never sees, from a
+checkpoint and scores each render against the true image with the three
+measures of the paper's tables. The paper's protocol for its synthetic scenes
+is all 200 test views at 800x800, and each number it reports is the mean over
+those views. For Lego (Table 4) it reports PSNR 32.54, SSIM 0.961 and LPIPS
+0.050.
+
+The script prints the paper's row next to its own only when it has scored
+exactly that. Anything else is labelled as not comparable, in the output and
+in `summary.json`. That includes `--skip 8`, which scores every eighth view,
+the subset the released code renders by default (`testskip = 8`), and takes an
+eighth of the time.
+
+How each number is computed:
+
+- **PSNR.** `-10 log10(MSE)` of each view, on colours in [0, 1], then the mean
+  over the views.
+- **SSIM.** The released code computes PSNR only, so this is the measure as
+  Wang et al. (2004) defined it: an 11x11 Gaussian window with standard
+  deviation 1.5, K1 = 0.01 and K2 = 0.03, only windows that lie fully inside
+  the image, and the mean over window positions and colour channels.
+- **LPIPS.** The reference `lpips` package, version 0.1 of the measure, with
+  images scaled to [-1, 1]. The paper does not say which of the LPIPS networks
+  it used. I use VGG: [NerfBaselines](https://nerfbaselines.github.io/blender),
+  which re-runs published methods under one protocol, lists the paper's value
+  as LPIPS (VGG), and its own run of NeRF on Lego gives 0.049 against the
+  paper's 0.050.
+
+All three are computed from the render as it comes out of the network, before
+it is rounded to 8 bits for the image file. A row of `per_view.csv` is written
+as each view finishes, and running the same command again carries on with the
+views that are missing, so a long evaluation can be stopped and continued.
+Results are tied to what they were computed from: the script refuses to add to
+a directory that holds scores of other weights, other cameras, other views or
+another image size.
+
+LPIPS needs the ImageNet weights of VGG-16 (528 MB), which torchvision
+downloads on first use. They are kept in `data/torch_hub`.
+
 ## What is here
 
 - `src/nerf/rays.py`: the camera model. One ray per pixel from a camera pose,
@@ -215,8 +264,9 @@ for one has been requested.
   whole images.
 - `src/nerf/data.py`: the container for posed images, the loader for the
   paper's synthetic scenes, camera pose helpers and the analytic sphere scene.
+- `src/nerf/metrics.py`: PSNR, SSIM and LPIPS.
 - `src/nerf/train.py`: the training step and the state it changes,
-  hyperparameters, checkpoints and evaluation by PSNR.
+  hyperparameters, checkpoints, and loading trained networks back from one.
 - `src/nerf/hull.py`: space carving. The visual hull of a scene from its
   silhouettes, used to check cameras without training.
 - `scripts/00_smoke_test.py`: the end-to-end run described above.
@@ -226,7 +276,9 @@ for one has been requested.
   that script. It makes no AWS calls.
 - `scripts/03_sagemaker.py`: uploads the code, starts the job, follows its
   log, stops it.
-- `tests/`: unit tests for the eight modules and the launcher.
+- `scripts/04_evaluate.py`: the scoring described above.
+- `tests/`: unit tests for the nine modules, the launcher and the scoring
+  script.
 
 ## How it is checked
 
@@ -275,6 +327,31 @@ so the right answer is known:
 - a checkpoint is refused if the model or sampling settings differ from the
   ones it was made with, and a save that dies halfway leaves the previous
   checkpoint intact.
+
+**Scores.**
+
+- SSIM equals the closed form for two flat images, equals a second
+  implementation that evaluates the definition one window at a time, and
+  agrees with scikit-image to nine decimal places on image pairs that range
+  from nearly identical to unrelated;
+- the scoring script's numbers for each test view equal those of a render made
+  independently in the test, the saved image is that render, and the summary
+  is the mean of the per-view table;
+- an evaluation interrupted after two views continues with the other three and
+  ends with the same table as one that was never stopped, and a row cut short
+  or a lost render is done again;
+- scores of different weights are never mixed, also when the step count is the
+  same, nor those of another scene in a directory of the same name, and the
+  paper's row is shown only for the paper's protocol;
+- a checkpoint kept at step 4 of a 6-step run, put in place of the latest
+  one, continues to the same weights at step 6;
+- the training script refuses to continue a run at another image size, which
+  the scoring script relies on when it shrinks the test images as in training.
+
+The tests run LPIPS on a VGG-16 that is left randomly initialised, so that
+none of them downloads 528 MB. They check what goes into the network (image
+range, channel order, where the weights are looked for), not the values that
+come out, which are the reference package's.
 
 **Data and cameras.**
 
