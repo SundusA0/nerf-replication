@@ -43,7 +43,7 @@ from PIL import Image
 from nerf.data import blender_frames, load_blender
 from nerf.metrics import Lpips, psnr, ssim
 from nerf.render import render_image
-from nerf.train import load_networks, pick_device
+from nerf.train import load_networks, pick_device, weights_fingerprint
 
 REPO = Path(__file__).resolve().parents[1]
 COLUMNS = ["view", "name", "psnr", "ssim", "lpips", "seconds"]
@@ -72,16 +72,6 @@ def protocol_differences(split: str, views: int, views_in_split: int, height: in
     if (height, width) != (PAPER_SIZE, PAPER_SIZE):
         differences.append(f"{width} x {height} images, not {PAPER_SIZE} x {PAPER_SIZE}")
     return differences
-
-
-def weights_fingerprint(*networks: torch.nn.Module) -> str:
-    """A short hash of the networks' weights, to tell one trained model from another."""
-    digest = hashlib.sha256()
-    for network in networks:
-        for name, tensor in network.state_dict().items():
-            digest.update(name.encode())
-            digest.update(tensor.detach().cpu().numpy().tobytes())
-    return digest.hexdigest()[:16]
 
 
 def file_fingerprint(path: Path) -> str:

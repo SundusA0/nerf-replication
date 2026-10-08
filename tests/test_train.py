@@ -19,6 +19,7 @@ from nerf.train import (
     sample_ray_batch,
     save_checkpoint,
     train,
+    weights_fingerprint,
 )
 
 
@@ -359,3 +360,26 @@ def test_load_networks_rebuilds_the_trained_networks_from_the_file_alone(tiny_vi
     before = render_image(trainer.coarse, trainer.fine, *camera, *samples, white_background=True).rgb
     after = render_image(loaded.coarse, loaded.fine, *camera, *samples, white_background=True).rgb
     assert torch.equal(before, after)
+
+
+def test_fingerprint_tells_trained_models_apart(tiny_views, tmp_path):
+    trainer = Trainer(tiny_views, tiny_config())
+    trainer.step()
+    save_checkpoint(tmp_path / "checkpoint.pt", trainer)
+    mark = weights_fingerprint(trainer.coarse, trainer.fine)
+    assert len(mark) == 16 and int(mark, 16) >= 0            # 16 hexadecimal digits
+
+    # the same weights give the same mark, also after a trip through a file
+    loaded = load_networks(tmp_path / "checkpoint.pt")
+    assert weights_fingerprint(loaded.coarse, loaded.fine) == mark
+    # one more step, or a change to a single weight of either network, gives another
+    trainer.step()
+    assert weights_fingerprint(trainer.coarse, trainer.fine) != mark
+    for network in (loaded.coarse, loaded.fine):
+        with torch.no_grad():
+            next(network.parameters())[0, 0] += 1e-3
+        assert weights_fingerprint(loaded.coarse, loaded.fine) != mark
+        with torch.no_grad():
+            next(network.parameters())[0, 0] -= 1e-3
+    # and the two networks are not interchangeable
+    assert weights_fingerprint(loaded.fine, loaded.coarse) != weights_fingerprint(loaded.coarse, loaded.fine)

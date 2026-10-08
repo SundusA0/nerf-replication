@@ -52,6 +52,15 @@ class Views:
             None if self.alpha is None else self.alpha.to(device),
         )
 
+    def select(self, indices) -> "Views":
+        """The views at these positions, in the order given."""
+        indices = torch.as_tensor(indices, dtype=torch.long, device=self.images.device).reshape(-1)
+        return Views(
+            self.images[indices], self.poses[indices],
+            self.focal, self.near, self.far, self.white_background,
+            None if self.alpha is None else self.alpha[indices],
+        )
+
 
 def blender_frames(scene_dir, split: str = "train") -> list[str]:
     """The image paths of one split of a NeRF synthetic scene, in file order.
@@ -199,6 +208,19 @@ class SphereScene:
             sigma[inside] = self.density
             rgb[inside] = points.new_tensor(colour)
         return sigma, rgb
+
+    def distance_to_surface(self, points: torch.Tensor) -> torch.Tensor:
+        """(...) signed distance from each point to the surface of the scene.
+
+        Positive outside the spheres, negative inside one, zero on a surface.
+        This is the exact geometry of the scene, to measure reconstructed
+        geometry against. The spheres do not overlap, so the nearest surface
+        is that of the sphere whose surface is nearest.
+        """
+        centres = points.new_tensor([centre for centre, _, _ in self.SPHERES])
+        radii = points.new_tensor([radius for _, radius, _ in self.SPHERES])
+        to_each = (points[..., None, :] - centres).norm(dim=-1) - radii      # (..., 4)
+        return to_each.min(dim=-1).values
 
 
 def analytic_views(

@@ -10,13 +10,15 @@ published ones.
 
 ## Status
 
-In progress. The pipeline trains end to end on a small synthetic scene, and
-a first short run on the paper's Lego scene at 1/8 resolution reaches 22.5 dB
-on a held-out view after 2,000 steps on a laptop GPU. The same training runs
-as an Amazon SageMaker job, where it reproduces the laptop's loss. The script
-that scores a trained model on the test views with the paper's three measures
-is written and tested. The full-resolution run has not finished yet, so there
-is nothing to compare with the paper.
+In progress. The pipeline trains end to end on a small synthetic scene. On the
+paper's Lego scene, a first short run at 1/8 resolution (2,060 steps on a
+laptop GPU) scores PSNR 23.84 dB, SSIM 0.855 and LPIPS 0.136 on 25 test views.
+That shows training and scoring at work and is not yet a number to set against
+the paper's. The same training runs as an Amazon SageMaker job, where it
+reproduces the laptop's loss. A trained model can be turned into a coloured
+triangle mesh, which is checked against the scene's photographs. The
+full-resolution run has not finished yet, so there is nothing to compare with
+the paper.
 
 | Part | Paper | Status |
 | --- | --- | --- |
@@ -32,7 +34,8 @@ is nothing to compare with the paper.
 | Launcher for Amazon SageMaker training jobs | | Implemented, tested; CPU jobs run on AWS, GPU run pending |
 | PSNR, SSIM and LPIPS on the test views | Section 6 | Implemented, tested |
 | Lego at full resolution: scores against the paper | Table 4 | Next |
-| Mesh extraction from the trained density | not in the paper | Planned |
+| Mesh extraction from the trained density | not in the paper | Implemented, tested on known geometry |
+| Lego mesh from the full-resolution model | not in the paper | Next |
 
 ## First trained result
 
@@ -47,11 +50,54 @@ trained network. The numbers from the run are in `results/smoke_test.json`.
 The script fails if the mean held-out PSNR is below 20 dB; a blank white image
 scores about 8.5 dB.
 
-This shows that the pipeline learns a 3D scene from 2D images alone. It is not
-a replication result. The training images come from this repository's own
-renderer applied to a scene with known density and colour, and the network and
-sample counts are far smaller than the paper's so that the run takes a couple
-of minutes on a laptop CPU.
+The same run then turns the trained network into a triangle mesh (see Mesh
+below) and measures the mesh against the spheres, whose surface is known
+exactly.
+
+![Top row: true held-out views. Middle row: the mesh in its colours. Bottom row: the shape of the mesh.](results/smoke_test_mesh.png)
+
+Top row: the true held-out views. Middle row: the mesh, in the colours the
+network gives it. Bottom row: the shape of the mesh, lit from the camera.
+
+Four things are measured from the held-out viewpoints, and the script fails
+if the mesh misses any of them: its outline overlaps the true outline by at
+least 0.92 (intersection over union); the points of it that the cameras see
+are on average within 0.04 of the true surface; it encloses the spheres'
+volume to within 20 %; its colours are on average within 0.10 of the true
+views'. For scale, the largest sphere has radius 0.7, the mesh is taken from a
+grid with cells of 0.025, and one pixel of the 48x48 training images covers
+0.06 at the spheres' distance.
+
+Two meshes that need no training are measured the same way, to say what those
+numbers are worth:
+
+| Mesh | Outline IoU | Mean distance to the true surface | Volume, true = 1 |
+| --- | --- | --- | --- |
+| From the trained network | about 0.95 | about 0.02 | about 0.9 |
+| Visual hull carved from the 24 training outlines | 0.962 | 0.0156 | 0.93 |
+| The scene's exact density on the same grid | 0.983 | 0.0035 | 1.00 |
+
+The last two rows involve no training and come out the same on every run. The
+first depends on the run, so it is given roughly; `results/smoke_test.json`
+has the numbers of the run pictured. In the runs made so far the network's
+mesh lay, on balance, a little inside the true surface, by a fraction of a
+grid cell. Mesh below says where that comes from.
+
+The hull does as well as the network's mesh here. Spheres are convex, so
+their outlines already say nearly everything about them, and this scene cannot
+show what a NeRF adds to a hull, which is the surface inside the outline. What
+it does show is that training, meshing and measuring work together, and how
+close a mesh from a network this small comes to a surface that is known. (A
+hull encloses its object, yet this one has less than the spheres' volume. It
+is carved from outlines only 48 pixels across by looking up the nearest pixel,
+which can shave up to half a pixel off it, and some training views crop the
+outer spheres.)
+
+The run as a whole shows that the pipeline learns a 3D scene from 2D images
+alone. It is not a replication result. The training images come from this
+repository's own renderer applied to a scene with known density and colour,
+and the network and sample counts are far smaller than the paper's so that
+the run takes a couple of minutes on a laptop CPU.
 
 ## Data
 
@@ -251,6 +297,120 @@ another image size.
 LPIPS needs the ImageNet weights of VGG-16 (528 MB), which torchvision
 downloads on first use. They are kept in `data/torch_hub`.
 
+### First scores
+
+The first run on real data: the model from a short Lego run at 1/8 resolution
+(2,060 steps on a laptop GPU), scored on every eighth test view.
+
+```
+python scripts/04_evaluate.py data/nerf_synthetic/lego runs/lego_100px/checkpoint.pt --skip 8
+```
+
+```
+25 of 200 test views at 100 x 100, checkpoint at step 2060
+
+              PSNR    SSIM   LPIPS
+this run     23.84   0.855   0.136
+
+Not the paper's protocol: 25 of the 200 test views; 100 x 100 images, not 800 x 800.
+The paper's numbers for this scene (PSNR 32.54, SSIM 0.961, LPIPS 0.050)
+are for all 200 test views at 800 x 800 and cannot be set against these.
+```
+
+![Top row: four of the true test views. Bottom row: the model's renders of them.](results/lego_100px_step2060_test.png)
+
+Top row: four of the true test views. Bottom row: the model's renders of the
+same views. As the output says, these numbers are not comparable with the
+paper's. They show the three measures working on the real scene, LPIPS with
+the real VGG-16 weights included. Rendering took about 3 s per 100x100 view,
+so a full 800x800 view will take about 3 minutes on the same laptop. The full
+record is `results/lego_100px_step2060_test.json`.
+
+## Mesh
+
+```
+python scripts/05_extract_mesh.py data/nerf_synthetic/lego runs/lego_800px/checkpoint.pt
+```
+
+A NeRF stores a scene as density and colour throughout space, not as a
+surface. This script turns a trained model into a triangle mesh with vertex
+colours, the form most 3D tools work with:
+
+1. The fine network's density is sampled on a grid of 257 points per axis
+   spanning [-1.2, 1.2], as in the authors' `extract_mesh.ipynb`.
+2. Empty pockets that the surface seals off on all sides are filled. In the
+   mesh each would be an inner wall that nothing outside can show.
+3. Marching cubes (scikit-image's) extracts the surface on which the density
+   equals a threshold, as in the notebook.
+4. Pieces with less than 1 % of the largest piece's area are dropped. A NeRF
+   usually leaves a few specks of density floating in empty space.
+5. Every vertex gets the colour the model shows when looked at head-on: a
+   short ray along the inward normal, from one grid cell outside the surface
+   to three inside, rendered with the same quadrature as an image pixel.
+
+It writes `mesh.ply`, which opens in MeshLab or Blender, a `preview.png` and a
+`summary.json`.
+
+**The threshold.** The notebook uses a density of 50 on its example model
+(200,000 steps at half resolution), and prints that 3.6 % of the grid lies
+above it and that the mesh has 791,052 triangles. How much the choice matters
+depends on how sharp the model's surfaces are. Where the density jumps from
+zero to hundreds between two neighbouring grid points, the threshold only
+moves the surface within that one cell. A small or early model has soft
+surfaces, and its mesh swells or shrinks with the threshold by many cells.
+
+So by default the threshold is chosen with the photographs, and only ever
+downwards from the authors' 50. For 13 values from 1 to 50 the outline of the
+mesh is compared with the object's outline in eight of the training
+photographs, and the values that score within 0.01 of the best count as
+fitting equally well. If 50 is one of them, it is used. If not, the lowest of
+them is: a higher threshold only ever removes material, and a thin or faint
+part of the object can vanish whole for a gain in score too small to mean
+anything. Nothing above 50 is tried for the same reason. On a model with hard
+surfaces the outline score keeps creeping up with the threshold, because the
+surface moves inwards within its grid cell, while everything fainter than the
+threshold is lost. `--threshold` with a number uses that number whatever the
+outlines say.
+
+**Checking a mesh without 3D ground truth.** Nothing tells a NeRF where
+surfaces are, so the mesh is scored against photographs the model was not
+trained on. A small rasteriser (`rasterise` in `src/nerf/mesh.py`) works out
+which triangle each pixel of a test camera sees. The pixels the mesh covers
+are compared with the pixels where the photograph shows the object, as
+intersection over union: 1 means the two outlines are identical. The same
+rasteriser draws the preview: for four test cameras, the photograph, the mesh
+in its colours, and the mesh in plain grey to show its shape.
+
+**What that score does not show.** It shows that the mesh is in the right
+place, at the right size and with the right outline. It is blind to everything
+inside the outline. A dent leaves it unchanged, and a visual hull carved from
+the same outlines would score as well as the true surface. A thin part counts
+for no more than the few pixels it covers. A part that no camera sees from the
+side, such as an underside when every camera looks down from above, does not
+enter it at all.
+
+A threshold chosen by outlines shares that blindness, in two ways. A part of
+the object that makes up less of the outline than the 0.01 allowed can come or
+go without the choice noticing. And the outline of a rough surface is drawn by
+the tops of its bumps, so the mesh with the best outline lies, on average,
+inside the true surface by about the height of the bumps. Taking the lowest
+threshold among those that fit gives some of that back. On the sphere scene of
+the smoke test, where the true surface is known, the meshes chosen this way
+have still ended up a fraction of a grid cell inside the surface (see First
+trained result above; `surface_distance_signed` in `results/smoke_test.json`
+is the figure for the run pictured). A model trained for longer should have
+smoother surfaces and less to lose, but photographs alone cannot say how much
+is left.
+
+Vertex colours have limits of their own. A mesh has one colour per point, so
+a highlight that moves with the viewpoint is frozen as seen from straight
+ahead, and for a surface that no camera faced that is a direction the network
+never saw. A sheet thinner than three grid cells takes some colour from its
+far side.
+
+Outlines are compared in photographs of the size the model was trained on.
+The end of "Where this follows the released code and not the paper" says why.
+
 ## What is here
 
 - `src/nerf/rays.py`: the camera model. One ray per pixel from a camera pose,
@@ -269,6 +429,8 @@ downloads on first use. They are kept in `data/torch_hub`.
   hyperparameters, checkpoints, and loading trained networks back from one.
 - `src/nerf/hull.py`: space carving. The visual hull of a scene from its
   silhouettes, used to check cameras without training.
+- `src/nerf/mesh.py`: from a density field to a coloured triangle mesh, and
+  a rasteriser to look at the mesh through the scene's cameras.
 - `scripts/00_smoke_test.py`: the end-to-end run described above.
 - `scripts/01_check_dataset.py`: the dataset check described above.
 - `scripts/02_train.py`: training on a synthetic scene, as described above.
@@ -277,8 +439,9 @@ downloads on first use. They are kept in `data/torch_hub`.
 - `scripts/03_sagemaker.py`: uploads the code, starts the job, follows its
   log, stops it.
 - `scripts/04_evaluate.py`: the scoring described above.
-- `tests/`: unit tests for the nine modules, the launcher and the scoring
-  script.
+- `scripts/05_extract_mesh.py`: the mesh extraction described above.
+- `tests/`: unit tests for the ten modules, the launcher, and the scoring and
+  mesh scripts.
 
 ## How it is checked
 
@@ -353,6 +516,55 @@ none of them downloads 528 MB. They check what goes into the network (image
 range, channel order, where the weights are looked for), not the values that
 come out, which are the reference package's.
 
+**Mesh.** Every check is against a shape whose geometry is known exactly.
+
+- A cube built by hand has its area and volume and is reported as a closed
+  surface. A missing or flipped triangle is noticed. Two cubes that share an
+  edge are still closed, with the volume of both.
+- The surface extracted from a smooth ball of radius 0.5 has every vertex
+  within 0.001 of the sphere, the sphere's volume and area to 0.5 %, and
+  normals that point outwards.
+- On the analytic sphere scene the mesh comes out as four closed pieces with
+  the spheres' volume to 1 %, and every vertex within half a grid spacing of
+  a true sphere, which is all a density that jumps from 0 to 40 allows.
+- A hollow ball loses its inner wall when its pocket is filled, and its outer
+  surface keeps every vertex. A hollow with a way out is left as it is.
+- Vertex colours are the spheres' colours, and a field whose colour encodes
+  the viewing direction shows that they are taken looking in along the normal.
+  For a ball painted red in its outer two grid cells and blue below, the
+  colour is 94.0 % red at a density of 40 and 69.9 % at a density of 3.2,
+  the shares worked out by hand from the ray's 16 steps.
+- The rasteriser gives a triangle exactly the pixels inside it, 54 in the
+  test, counted by hand. The nearest triangle wins. For a steeply tilted
+  triangle, the point it reports at each pixel lies on the ray that `get_rays`
+  sends through that pixel, at the reported depth. Splitting the work
+  differently does not change the result.
+- A second implementation that shares no code with the rasteriser, one ray
+  per pixel intersected with every triangle, sees the same triangle at every
+  pixel: 400 random triangles that hide one another, from three cameras.
+- The outline score of a triangle against a block of pixels is 48/102, the
+  two counts made by hand.
+- The mesh of the sphere scene, seen through held-out cameras, lies within
+  half a grid spacing of the true spheres at every pixel, and its outline
+  overlaps the renderer's by more than 0.95. A mesh that is moved, mirrored
+  or swollen by 15 % scores below 0.85.
+- The threshold chosen for a density that fades smoothly from the centre of a
+  ball, whose level surfaces are spheres of known radius, is the level with
+  the photographed radius. For a ball with a hard surface, where all
+  thirteen candidates score within 0.01 of each other, it is the authors' 50.
+- The smoke test's four requirements are tried on the exact mesh of the
+  sphere scene after damaging it. Without its smallest sphere, turned inside
+  out, with its colours swapped, or with one triangle missing, it fails the
+  one requirement that is there for that damage and passes the others.
+- The script is run with the exact scene in the place of a trained network:
+  it writes a closed mesh in four pieces with the right colours, fits the
+  threshold to training views and scores on test views at the size the run
+  was trained on, removes a speck floating apart from the spheres, gives a
+  hollow object no inner wall, and reports an open surface, without a volume,
+  when the grid is too small for the object. It names what is missing or in
+  the way before the slow part starts: a photograph, the run's settings, or
+  an output directory that holds a training run or other results.
+
 **Data and cameras.**
 
 - a scene written to disk in the dataset's format is read back exactly:
@@ -409,9 +621,18 @@ follow the code:
    iterations, and its learning rate falls by a factor of 10 every 500k steps,
    which gives the paper's 5e-4 to 5e-5 only over a 500k run.
 
-One more choice is inherited from the code and is not stated in the paper:
-the network is initialised Glorot-uniform with zero biases, the default of the
+Two more choices are inherited from the code and are not stated in the paper.
+
+The network is initialised Glorot-uniform with zero biases, the default of the
 TensorFlow layers the authors used. PyTorch's default is different.
+
+Pixel coordinates are whole numbers, with no half-pixel offset, and smaller
+images are made by averaging blocks of pixels. The centre of a block of d by d
+pixels is (d - 1)/2 full-size pixels away from the pixel the camera model
+takes it for. A model trained on shrunk images is therefore fitted to cameras
+that are off by that much, and is slightly out of register with photographs of
+another size. The scoring and mesh scripts use the size the model was trained
+on.
 
 ## Setup
 

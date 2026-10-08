@@ -12,6 +12,7 @@ pixels should match photographs.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import time
@@ -258,6 +259,16 @@ def load_networks(path, device: str = "cpu") -> TrainedNetworks:
         network.load_state_dict(state[name])
         networks[name] = network.to(device)
     return TrainedNetworks(networks["coarse"], networks["fine"], config, state["step"])
+
+
+def weights_fingerprint(*networks: torch.nn.Module) -> str:
+    """A short hash of the networks' weights, to tell one trained model from another."""
+    digest = hashlib.sha256()
+    for network in networks:
+        for name, tensor in network.state_dict().items():
+            digest.update(name.encode())
+            digest.update(tensor.detach().cpu().numpy().tobytes())
+    return digest.hexdigest()[:16]
 
 
 def train(views: Views, config: TrainConfig, device: str = "cpu", log=print) -> TrainResult:

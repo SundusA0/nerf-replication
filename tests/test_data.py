@@ -8,6 +8,7 @@ from PIL import Image
 
 from nerf.data import (
     SphereScene,
+    Views,
     analytic_views,
     blender_frames,
     load_blender,
@@ -109,6 +110,54 @@ def test_analytic_views_carry_silhouettes():
     for alpha in views.alpha:
         assert alpha[0, 0] == 0          # corner: empty
         assert alpha[16, 16] > 0.99      # centre: opaque object
+
+
+def test_distance_to_the_surface_of_the_sphere_scene_is_exact():
+    scene = SphereScene()
+    points = torch.tensor([
+        [0.0, 0.0, 0.0],       # the centre of the red sphere, radius 0.7
+        [0.0, -0.9, 0.0],      # 0.2 outside it, on the side away from the others
+        [2.0, 0.0, 0.0],       # beyond the green sphere, which ends at x = 1.45
+        [1.1, 0.0, 0.1],       # 0.1 from the centre of the green sphere, radius 0.35
+        [0.0, 0.0, 0.7],       # where the red and the yellow sphere touch
+        [0.725, 0.0, 0.0],     # midway in the gap of 0.05 between the red and the green
+        [0.0, 3.0, 4.0],       # far out: nearest is the yellow one on top, radius 0.25
+    ])
+    expected = torch.tensor([-0.7, 0.2, 0.55, -0.25, 0.0, 0.025, math.sqrt(9 + 3.05**2) - 0.25])
+    assert torch.allclose(scene.distance_to_surface(points), expected, atol=1e-6)
+
+    # It agrees with the density: negative exactly where there is density.
+    cloud = (torch.rand(5000, 3, generator=torch.Generator().manual_seed(0)) - 0.5) * 3.2
+    distance = scene.distance_to_surface(cloud)
+    inside = scene(cloud, torch.zeros_like(cloud))[0] > 0
+    assert 200 < inside.sum() < 1000 and torch.equal(distance < 0, inside)
+    # Stepping along the outward direction of the nearest sphere by the distance lands on a surface.
+    centres = torch.tensor([centre for centre, _, _ in SphereScene.SPHERES])
+    radii = torch.tensor([radius for _, radius, _ in SphereScene.SPHERES])
+    from_each = cloud[:, None] - centres
+    nearest = (from_each.norm(dim=-1) - radii).argmin(dim=1)
+    outward = torch.nn.functional.normalize(from_each[torch.arange(5000), nearest], dim=-1)
+    landed = cloud - distance[:, None] * outward
+    assert scene.distance_to_surface(landed).abs().max() < 1e-5
+    # any leading shape, like the (H, W, 3) points of an image
+    assert scene.distance_to_surface(points.reshape(7, 1, 3)).shape == (7, 1)
+
+
+def test_views_can_be_selected():
+    views = analytic_views(5, image_size=8, num_samples=16)
+    chosen = views.select([3, 0])
+    assert len(chosen) == 2
+    assert torch.equal(chosen.images, views.images[[3, 0]])
+    assert torch.equal(chosen.poses, views.poses[[3, 0]])
+    assert torch.equal(chosen.alpha, views.alpha[[3, 0]])
+    assert (chosen.focal, chosen.near, chosen.far, chosen.white_background) == (
+        views.focal, views.near, views.far, views.white_background)
+    without_alpha = Views(views.images, views.poses, views.focal, views.near, views.far, True)
+    assert without_alpha.select([1]).alpha is None
+    # one position alone is still a set of views, with one view in it
+    one = views.select(2)
+    assert len(one) == 1 and one.images.shape == (1, 8, 8, 3) and one.poses.shape == (1, 4, 4)
+    assert torch.equal(one.alpha, views.alpha[2:3])
 
 
 # --------------------------------------------------------------------------
