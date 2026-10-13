@@ -16,9 +16,10 @@ laptop GPU) scores PSNR 23.84 dB, SSIM 0.855 and LPIPS 0.136 on 25 test views.
 That shows training and scoring at work and is not yet a number to set against
 the paper's. The same training runs as an Amazon SageMaker job, where it
 reproduces the laptop's loss. A trained model can be turned into a coloured
-triangle mesh, which is checked against the scene's photographs. The
-full-resolution run has not finished yet, so there is nothing to compare with
-the paper.
+triangle mesh, which is checked against the scene's photographs; the mesh of
+that short run overlaps the object's outline in the same 25 test views by 0.936
+(intersection over union). The full-resolution run has not finished yet, so
+there is nothing to compare with the paper.
 
 | Part | Paper | Status |
 | --- | --- | --- |
@@ -34,7 +35,7 @@ the paper.
 | Launcher for Amazon SageMaker training jobs | | Implemented, tested; CPU jobs run on AWS, GPU run pending |
 | PSNR, SSIM and LPIPS on the test views | Section 6 | Implemented, tested |
 | Lego at full resolution: scores against the paper | Table 4 | Next |
-| Mesh extraction from the trained density | not in the paper | Implemented, tested on known geometry |
+| Mesh extraction from the trained density | not in the paper | Implemented, tested on known geometry; first Lego mesh made |
 | Lego mesh from the full-resolution model | not in the paper | Next |
 
 ## First trained result
@@ -73,15 +74,19 @@ numbers are worth:
 
 | Mesh | Outline IoU | Mean distance to the true surface | Volume, true = 1 |
 | --- | --- | --- | --- |
-| From the trained network | about 0.95 | about 0.02 | about 0.9 |
+| From the trained network | 0.956 | 0.0167 | 0.94 |
 | Visual hull carved from the 24 training outlines | 0.962 | 0.0156 | 0.93 |
 | The scene's exact density on the same grid | 0.983 | 0.0035 | 1.00 |
 
 The last two rows involve no training and come out the same on every run. The
-first depends on the run, so it is given roughly; `results/smoke_test.json`
-has the numbers of the run pictured. In the runs made so far the network's
-mesh lay, on balance, a little inside the true surface, by a fraction of a
-grid cell. Mesh below says where that comes from.
+first row is the run pictured, on an Apple-silicon laptop, and
+`results/smoke_test.json` is its record. Another machine gives slightly
+different numbers: floating-point arithmetic differs in its last digits
+between processors and maths libraries, and two thousand training steps
+magnify the difference. An x86 Linux machine gave 0.953, 0.0174 and 0.94. On
+both machines the network's mesh lay, on balance, a little inside the true
+surface, by 0.011 and 0.012, under half a grid cell. Mesh below says where
+that comes from.
 
 The hull does as well as the network's mesh here. Spheres are convex, so
 their outlines already say nearly everything about them, and this scene cannot
@@ -117,11 +122,12 @@ axis with world +z up, and that carving a grid with the silhouettes of all
 training views leaves a visual hull which projects back onto those
 silhouettes. It writes its numbers to `results/dataset_check.json`.
 
-On Lego every check passes. All 100 training cameras are 4.0311 from the
-origin and look at it to within 0.04 degrees. The hull spans x from -0.60 to
-0.60, y from -1.10 to 1.12 and z from -0.51 to 0.98, and it projects back onto
-the silhouettes with a mean intersection over union of 0.935 (worst view
-0.916). For comparison, on the analytic test scene mirrored or upside-down
+On Lego every check passes. All 100 training cameras are 4.0311 from the origin
+and look at it to within 0.04 degrees. The hull, carved from the images shrunk
+to 100x100 on a grid of 128 points per axis over [-1.5, 1.5], spans x from
+-0.60 to 0.60, y from -1.10 to 1.12 and z from -0.51 to 0.98, and it projects
+back onto the silhouettes with a mean intersection over union of 0.935 (worst
+view 0.916). For comparison, on the analytic test scene mirrored or upside-down
 images score about 0.7, and the check requires 0.8.
 
 ## Training
@@ -410,6 +416,88 @@ far side.
 
 Outlines are compared in photographs of the size the model was trained on.
 The end of "Where this follows the released code and not the paper" says why.
+
+### First mesh
+
+The model of the short Lego run above (2,060 steps at 1/8 resolution), turned
+into a mesh. Of its 25 per-view lines, the output below keeps the first two
+and the last:
+
+```
+python scripts/05_extract_mesh.py data/nerf_synthetic/lego runs/lego_100px/checkpoint.pt
+```
+
+```
+checkpoint at step 2060, fine network on 257 points per axis in [-1.2, 1.2], device mps, torch 2.14.1
+density up to 57   (20 s)
+fitting the threshold to the object's outline in 8 training views
+    threshold   1   IoU 0.887
+    threshold 1.5   IoU 0.895
+    threshold   2   IoU 0.904
+    threshold   3   IoU 0.916
+    threshold   4   IoU 0.926
+    threshold   5   IoU 0.934
+    threshold   7   IoU 0.944
+    threshold  10   IoU 0.951
+    threshold  15   IoU 0.908
+    threshold  20   IoU 0.638
+    threshold  30   IoU 0.338
+    threshold  40   IoU 0.083
+    threshold  50   IoU 0.002
+    -> 7, the lowest within 0.01 of the best
+4.99 % of the grid is above the threshold of 7; 2,227 grid points in sealed pockets were filled
+surface: 398,511 vertices and 804,926 triangles in 1 piece; 934 smaller pieces removed
+closed surface: yes   volume 0.6996   area 23.8090   x -0.66 to 0.68  y -1.20 to 1.20  z -0.40 to 1.03
+view   0  silhouette IoU 0.943    0.1 s
+view   8  silhouette IoU 0.943    0.1 s
+...
+view 192  silhouette IoU 0.942    0.1 s
+
+silhouette against 25 of 200 test views at 100 x 100: IoU mean 0.936, worst 0.908
+results are in runs/lego_100px/mesh_002060
+```
+
+![Top row: four of the true test views. Middle row: the mesh in its colours. Bottom row: the shape of the mesh.](results/lego_100px_step2060_mesh.png)
+
+Top row: four of the true test views, at the 100-pixel size the model was
+trained on. Middle row: the mesh in its colours, seen from the same cameras.
+Bottom row: the shape of the mesh, lit from the camera. The full record is
+`results/lego_100px_step2060_mesh.json`.
+
+This model is far from trained, and the run shows what the threshold fit is
+for. Its density nowhere exceeds 57, so at the authors' threshold of 50 almost
+nothing of it is left: the outline score there is 0.002. The outlines fit best
+at 10; 7 is within 0.01 of that and lower, so 7 is used. The 934 pieces
+removed were not connected to the main piece, and each had less than 1 % of
+the main piece's area.
+
+In the 25 test photographs the outline of the mesh overlaps the object's by
+0.936 on average and by 0.908 in the worst view. For scale, the visual hull
+in Data above, which is carved from 100-pixel outlines, projects back onto the
+outlines it was carved from with 0.935.
+
+An outline score at 100 pixels cannot resolve an error smaller than a pixel,
+which is 0.03 in the scene's units. The full-size photographs can. The object
+lies inside the visual hull of its outlines. Carved from the 800-pixel training
+photographs on a grid of 257 points per axis over [-1.5, 1.5], the hull spans x
+from -0.633 to 0.633, y from -1.137 to 1.148 and z up to 0.996, and the true
+hull may reach up to one grid step, 0.012, beyond each figure. (This is larger
+than the hull in Data above: 100-pixel outlines shave a hull by up to half a
+pixel, as First trained result says, and the coarser grid there under-reports
+its box by up to a step of 0.024.) The mesh reaches past that box along the rim
+of the base plate, by up to 0.06, and at the top edge of the bucket, by up to
+0.04, and about 2 % of its surface lies more than a grid step outside it. That
+is one to two pixels at the size the model was trained on, about as soft as its
+renders under First scores look, and a low threshold puts the surface at the
+outer edge of that softness.
+
+What no photograph shows, the mesh invents. The training cameras sit at
+heights (z) from 0.51 to 4.03, all above the base plate, so its underside was
+never seen. In the mesh the plate is about 0.1 thick, and its underside sags
+to -0.40 under the machine and is coloured in smears; the volume the mesh
+encloses, 0.70, counts all of that. The visual hull has the same blind spot:
+it reaches down to -0.51, well below the plate, because every camera looks
+down on the plate and none sees beneath it.
 
 ## What is here
 
