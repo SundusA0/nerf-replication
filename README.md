@@ -19,7 +19,10 @@ reproduces the laptop's loss. A trained model can be turned into a coloured
 triangle mesh, which is checked against the scene's photographs; the mesh of
 that short run overlaps the object's outline in the same 25 test views by 0.936
 (intersection over union). The full-resolution run has not finished yet, so
-there is nothing to compare with the paper.
+there is nothing to compare with the paper. As the one improvement on the
+paper, Instant-NGP's hash encoding can take the place of the paper's network
+(`--model hash`). On the small test scene it learns far more per step but, on a
+CPU, no more per second; the comparison on Lego waits for a GPU.
 
 | Part | Paper | Status |
 | --- | --- | --- |
@@ -37,6 +40,7 @@ there is nothing to compare with the paper.
 | Lego at full resolution: scores against the paper | Table 4 | Next |
 | Mesh extraction from the trained density | not in the paper | Implemented, tested on known geometry; first Lego mesh made |
 | Lego mesh from the full-resolution model | not in the paper | Next |
+| Improvement: Instant-NGP's hash encoding in place of the frequency encoding | Mueller et al. 2022 | Implemented, tested; measured on the test scene; Lego comparison waits for a GPU |
 
 ## First trained result
 
@@ -138,7 +142,10 @@ python scripts/02_train.py data/nerf_synthetic/lego --out runs/lego_100px --down
 
 Without `--downscale` and `--iterations` this is the released paper
 configuration: 800x800 images, 1024 rays per step, 64 coarse and 128 fine
-samples per ray, 500k steps. The run directory receives the settings, a log,
+samples per ray, 500k steps. `--model hash` trains the hash-encoding model
+of the Improvement section instead of the paper's network, and `--minutes`
+ends a run after that much training time, so that two models can be given
+the same time. The run directory receives the settings, a log,
 a validation image and PSNR at intervals, and a checkpoint. Running the same
 command again resumes from the checkpoint, and a stop request (Ctrl-C, or the
 termination signal of a job scheduler) lets the current step finish and saves
@@ -344,8 +351,15 @@ colours, the form most 3D tools work with:
 
 1. The fine network's density is sampled on a grid of 257 points per axis
    spanning [-1.2, 1.2], as in the authors' `extract_mesh.ipynb`.
-2. Empty pockets that the surface seals off on all sides are filled. In the
-   mesh each would be an inner wall that nothing outside can show.
+2. The empty space inside the object is filled: pockets that the surface
+   seals off on all sides, and whatever no straight line from outside the
+   grid reaches through empty space, along the 26 directions of the grid's
+   lattice. In the mesh each such space would be an inner wall that nothing
+   outside can show. The second rule was added for the hash model of the
+   Improvement section, whose insides are a speckle of density that leaks
+   out through the surface; the first Lego mesh below was made with the
+   first rule alone. The rule also fills a hollow whose only opening lies in
+   a direction between those of the lattice.
 3. Marching cubes (scikit-image's) extracts the surface on which the density
    equals a threshold, as in the notebook.
 4. Pieces with less than 1 % of the largest piece's area are dropped. A NeRF
@@ -499,13 +513,130 @@ encloses, 0.70, counts all of that. The visual hull has the same blind spot:
 it reaches down to -0.51, well below the plate, because every camera looks
 down on the plate and none sees beneath it.
 
+## Improvement: a hash encoding in place of the frequency encoding
+
+The paper's model spends its time in the 8-layer network, which is evaluated
+at every sample of every ray and has to turn 63 sines and cosines into
+density and colour. Instant-NGP (Mueller, Evans, Schied and Keller 2022,
+*Instant Neural Graphics Primitives with a Multiresolution Hash Encoding*)
+replaces the fixed encoding with a learnt one: a vector of features at every
+vertex of 16 grids of growing resolution, interpolated at the sample's
+position, so that networks with one or two hidden layers of 64 units
+suffice behind it.
+Each grid is a hash table of 2^19 entries, so the finer grids share entries
+between their vertices. The paper reports NeRF's quality in seconds to
+minutes instead of hours. Most of that comes from custom GPU kernels and from
+skipping empty space, neither of which is used here. What is tested here is
+the encoding with its small networks and their own optimiser settings, and
+everything else the same: the sampling, the renderer, the loss, the scripts
+and the measures are those of the paper's network.
+
+```
+python scripts/02_train.py data/nerf_synthetic/lego --out runs/lego_hash --model hash --minutes 60
+python scripts/02_train.py data/nerf_synthetic/lego --out runs/lego_nerf --minutes 60
+```
+
+`--minutes` ends a run once it has been going for that long in total, over
+all its sessions (validation and saving included, a small part at the default
+intervals), and writes its summary as a finished run, so that two models can
+be given the same time; `--iterations` is the ceiling in steps as before. The
+scoring and mesh scripts read either model's checkpoint.
+
+The model (`src/nerf/hashgrid.py`, and `HashNeRF` in `src/nerf/model.py`),
+with the paper's settings:
+
+- 16 levels, 2 features per entry, 2^19 entries per level and 16 cells per
+  axis at the coarsest level, as in the paper; 2048 cells per axis at the
+  finest level, a factor of 1.38 per level, chosen for this scene (the paper
+  uses 512 to 524288 depending on the task): one cell of the finest level is
+  0.0015, under half a pixel of the 800-pixel photographs at the object's
+  distance. The scene is taken to lie in [-1.5, 1.5]^3 (`--hash-bound`);
+  points outside have density 0.
+- A level whose vertices fit its table is indexed directly; the others by the
+  paper's hash, the xor of the vertex coordinates times 1, 2654435761 and
+  805459861, modulo the table size. A position's features at a level are the
+  trilinear interpolation of its cell's 8 vertices. Entries start uniform in
+  [-1e-4, 1e-4].
+- Density: one hidden layer of 64 units to 16 outputs; the first, through an
+  exponential cut off at e^15, is the density. All 16 go on with the encoded
+  direction into two hidden layers of 64 and a sigmoid, which give the colour.
+- Training settings from Instant-NGP's own NeRF configuration
+  (`configs/nerf/base.json`): Adam at 1e-2 with beta2 0.99 and epsilon
+  1e-15, an L2 penalty of 1e-6 on the layers' weights and biases but not on
+  the tables, and a rate that falls by a factor of 0.33 every 10k steps
+  after the first 20k.
+
+Where this differs from Instant-NGP: directions are encoded with NeRF's
+frequencies, not spherical harmonics, one thing fewer to differ between the two
+models; the loss is the paper's squared error, not Huber; there is no moving
+average of the weights; samples are placed as NeRF places them, 64 coarse and
+128 fine per ray with a coarse and a fine network that are both hash models,
+with no occupancy grid and no early ending of rays; the rate falls smoothly
+where Instant-NGP steps it down; and PyTorch's Adam goes on moving a table
+entry for some steps after its gradient has fallen to zero, where Instant-NGP's
+skips it.
+
+**On the test scene.** `scripts/00_smoke_test.py --model hash` runs the
+smoke test with the hash model in place of the small NeRF, with tables made
+small to match (2^15 entries, finest level 512): the same 24 images, rays,
+samples and measures. The three runs below were made one after another on
+the same x86 Linux machine, on its CPU, with nothing else running:
+
+| Model | Parameters per network | Steps | Training time | Held-out PSNR | Outline IoU | Distance to the true surface | Volume, true = 1 | Colour error |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| The paper's network, 4 layers of 64 | 27,876 | 2,000 | 71 s | 24.33 dB | 0.953 | 0.0174 | 0.94 | 0.039 |
+| Hash encoding, tables of 2^15 | 1,058,899 | 2,000 | 339 s | 29.07 dB | 0.968 | 0.0133 | 0.93 | 0.016 |
+| The paper's network, 4 layers of 64 | 27,876 | 9,100 | 345 s | 29.07 dB | 0.971 | 0.0102 | 0.97 | 0.015 |
+
+![Top row: true held-out views. Middle row: the hash model's mesh in its colours. Bottom row: its shape.](results/smoke_test_hash_mesh.png)
+
+The hash model's mesh after 2,000 steps, drawn like the small NeRF's under
+First trained result. Its surface is bumpier, yet closer to the true spheres
+than the small NeRF's after the same number of steps.
+
+Step for step the hash model learns much faster: after 2,000 steps it is
+4.7 dB ahead, with a better mesh. But on this CPU a step of it costs almost
+five times as much, and given the same time the small NeRF reaches the same
+PSNR, to the hundredth, and a slightly better mesh. So on this scene and this
+hardware the hash encoding buys nothing. That is not the paper's setting: its
+speed comes from GPU kernels that make a table lookup nearly free, the scene
+here is four spheres that a small smooth network already fits well, and the
+NeRF here is the 4-layer one of the smoke test, not the paper's 8 layers of
+256. Whether the encoding pays on Lego, against the paper's network, on a
+GPU, is what the comparison below is for. The records are
+`results/smoke_test_hash.json` and `results/smoke_test_equal_time.json` (the
+9,100-step run); the 2,000-step run of the paper's network gave the mesh
+numbers quoted for this machine under First trained result.
+
+**What the hash model's inside looks like.** The inside of an object is
+seen by no ray, so its density is whatever training leaves there. The paper's
+network, being smooth, fills it in. The hash model leaves a speckle of high
+and low values. Why is not settled here; candidates are that those entries
+stop getting a gradient once the surface around them has formed, that they
+share table entries with points elsewhere, and that Adam keeps moving them
+for a while after their gradient is gone. Meshed as the first Lego mesh was,
+with only sealed pockets filled, that gave walls within walls: in a run of
+this smoke test before the change, the hash model's mesh enclosed 0.76 of
+the spheres' volume, because the speckle leaks out through the surface and
+so seals no pocket (that run's record was not kept). Filling, in addition,
+every empty grid point that no line of sight from outside the grid reaches
+through empty space (Mesh above) gives the volume in the table.
+
+**On Lego.** Not measured yet. The comparison is the two commands at the top
+of this section, run on the same machine for the same number of minutes,
+scored with `scripts/04_evaluate.py` and meshed with
+`scripts/05_extract_mesh.py`. It needs a GPU; this section will get its
+table when the SageMaker quota comes through.
+
 ## What is here
 
 - `src/nerf/rays.py`: the camera model. One ray per pixel from a camera pose,
   and the reverse, from a 3D point to the pixel it appears at.
 - `src/nerf/encoding.py`: positional encoding of positions and directions.
-- `src/nerf/model.py`: the network, from position and viewing direction to
-  density and colour.
+- `src/nerf/model.py`: the networks, from position and viewing direction to
+  density and colour: the paper's, and Instant-NGP's behind the hash
+  encoding.
+- `src/nerf/hashgrid.py`: the multiresolution hash encoding of positions.
 - `src/nerf/render.py`: stratified sampling, the quadrature of the volume
   rendering integral, importance sampling from the coarse weights, the
   two-pass coarse-then-fine rendering of a batch of rays, and rendering of
@@ -517,8 +648,9 @@ down on the plate and none sees beneath it.
   hyperparameters, checkpoints, and loading trained networks back from one.
 - `src/nerf/hull.py`: space carving. The visual hull of a scene from its
   silhouettes, used to check cameras without training.
-- `src/nerf/mesh.py`: from a density field to a coloured triangle mesh, and
-  a rasteriser to look at the mesh through the scene's cameras.
+- `src/nerf/mesh.py`: from a density field to a coloured triangle mesh,
+  lines of sight through the density, and a rasteriser to look at the mesh
+  through the scene's cameras.
 - `scripts/00_smoke_test.py`: the end-to-end run described above.
 - `scripts/01_check_dataset.py`: the dataset check described above.
 - `scripts/02_train.py`: training on a synthetic scene, as described above.
@@ -528,8 +660,8 @@ down on the plate and none sees beneath it.
   log, stops it.
 - `scripts/04_evaluate.py`: the scoring described above.
 - `scripts/05_extract_mesh.py`: the mesh extraction described above.
-- `tests/`: unit tests for the ten modules, the launcher, and the scoring and
-  mesh scripts.
+- `tests/`: unit tests for the eleven modules, the launcher, and the
+  training, scoring and mesh scripts.
 
 ## How it is checked
 
@@ -552,6 +684,40 @@ and not only for tensor shapes:
 **Network.** The layer sizes are those of Fig. 7, which add up to 595,844
 parameters per network. Density does not change when the viewing direction
 does, and colour does.
+
+**Hash encoding and its network.**
+
+- The levels' resolutions grow geometrically, 16 to 2048 in 16 steps of a
+  factor 1.38, and are floored to whole numbers. A level with 8^3 vertices and a table of 1024
+  entries is indexed directly, in x-major order; one with 16^3 vertices is
+  indexed by Eq. 4 of the paper, checked against the formula written out
+  with the paper's primes, and a table that exactly holds a level's
+  vertices still counts as direct.
+- Interpolation: a position on a vertex gets that vertex's features, a
+  quarter of the way to the next gets the blend, and a linear function
+  stored at the vertices of a level is read back exactly anywhere, the box's
+  far corner included. The gradient of a position's features reaches exactly
+  the 8 vertices of its cell, with the trilinear weights, which sum to 1.
+- Computing all levels at once gives the same numbers as computing one
+  vertex at a time with the formula, for a mix of direct and hashed levels.
+- Points outside the box are flagged and encoded as if clamped to it, and the
+  model gives them density 0. The truncated exponential equals exp below the
+  cut and passes a gradient of e^15 above it, where exp of a clamped input
+  would pass none.
+- The layer sizes are Instant-NGP's; density ignores the viewing direction
+  while colour depends on it, and on the position; every parameter is
+  connected to the output; the initialisation is NeRF's.
+- Training with the hash model lowers the loss on the test scene, to less
+  than half within 60 steps and below the small NeRF's at the same point; a
+  checkpoint resumes exactly and loads back as a hash model; a checkpoint of
+  one model is refused by a run with the other; a checkpoint written before
+  the model choice existed still resumes. The L2 penalty reaches the layers'
+  weights and not the tables, and Adam gets the model's settings.
+- The training script trains the hash model, records its settings, resumes
+  it, and refuses to continue it with the paper's network; the scoring and
+  mesh scripts read its checkpoint. A time budget ends a run as finished at
+  the step it reached, with its checkpoint at that step; a budget already
+  spent ends at once and a larger one goes on.
 
 **Hierarchical sampling.** The network is replaced by an analytic opaque wall,
 so the right answer is known:
@@ -616,7 +782,20 @@ come out, which are the reference package's.
   the spheres' volume to 1 %, and every vertex within half a grid spacing of
   a true sphere, which is all a density that jumps from 0 to 40 allows.
 - A hollow ball loses its inner wall when its pocket is filled, and its outer
-  surface keeps every vertex. A hollow with a way out is left as it is.
+  surface keeps every vertex. A hollow with a way out is not a pocket.
+- Lines of sight: around a solid block every point is reached, its skin is
+  reached, its core is not, and what is solid follows the threshold. A single
+  point just above the threshold blocks a line, a point at the threshold
+  does not, and haze below it blocks nothing. A hole from a point to a face
+  lets a line in along each of the 26 lattice directions in turn, and a hole
+  that bends, or one that runs two steps along one axis for one along
+  another, does not. A ball whose inside is a speckle of empty points that
+  leaks out through three gaps, which seals almost no pocket, is given back
+  whole, to 3 % of its volume, with nothing outside it touched; a hollow
+  with a straight tunnel keeps the tunnel and the part of the hollow in line
+  with it; a slab leaves the space beneath it alone; a cloud of haze is not
+  filled. The mesh script fills such a speckle and reports the whole ball,
+  and says how many of the points it filled were in sealed pockets.
 - Vertex colours are the spheres' colours, and a field whose colour encodes
   the viewing direction shows that they are taken looking in along the normal.
   For a ball painted red in its outer two grid cells and blue below, the

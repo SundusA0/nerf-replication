@@ -3,7 +3,11 @@
     python scripts/02_train.py data/nerf_synthetic/lego --out runs/lego --downscale 8 --iterations 2000
 
 The defaults are the released paper configuration (`nerf.train.TrainConfig`)
-at full resolution. Everything the run produces goes into the --out directory:
+at full resolution. --model hash trains Instant-NGP's hash encoding and small
+networks in place of the paper's network, with that model's own learning-rate
+settings and everything else unchanged. --minutes stops the run once it has
+trained for that long in total, so two models can be given the same time.
+Everything the run produces goes into the --out directory:
 
     config.json            the settings of the run
     log.csv                step, loss, train PSNR, learning rate, steps per second
@@ -37,6 +41,7 @@ from nerf.data import load_blender
 from nerf.metrics import psnr
 from nerf.render import render_image
 from nerf.train import (
+    MODELS,
     TrainConfig,
     Trainer,
     TrainResult,
@@ -84,12 +89,22 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True, help="directory for this run")
     parser.add_argument("--downscale", type=int, default=1, help="shrink the images by this factor")
     parser.add_argument("--iterations", type=int, default=defaults.iterations)
+    parser.add_argument("--minutes", type=float, default=None,
+                        help="stop once the run has trained this long in total (default: no limit)")
+    parser.add_argument("--model", default=defaults.model, choices=MODELS,
+                        help="nerf (default): the paper's network; hash: Instant-NGP's encoding")
+    parser.add_argument("--learning-rate", type=float, default=None,
+                        help="default: the model's own (5e-4 for nerf, 1e-2 for hash)")
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--num-coarse", type=int, default=defaults.num_coarse)
     parser.add_argument("--num-fine", type=int, default=defaults.num_fine)
     parser.add_argument("--depth", type=int, default=defaults.depth)
     parser.add_argument("--width", type=int, default=defaults.width)
     parser.add_argument("--skip-layer", type=int, default=defaults.skip)
+    parser.add_argument("--hash-log2-size", type=int, default=defaults.hash_log2_size,
+                        help="hash model: each level's table has 2^this entries")
+    parser.add_argument("--hash-bound", type=float, default=defaults.hash_bound,
+                        help="hash model: the scene lies in [-bound, bound]^3")
     parser.add_argument("--precrop-iterations", type=int, default=defaults.precrop_iterations)
     parser.add_argument("--precrop-fraction", type=float, default=defaults.precrop_fraction)
     parser.add_argument("--seed", type=int, default=defaults.seed)
@@ -102,12 +117,18 @@ def main() -> int:
     parser.add_argument("--val-skip", type=int, default=25, help="use every n-th validation view")
     args = parser.parse_args()
 
-    config = TrainConfig(
+    if args.minutes is not None and args.minutes <= 0:
+        print("--minutes must be above 0.")
+        return 2
+    config = TrainConfig.for_model(
+        args.model,
         iterations=args.iterations, batch_size=args.batch_size,
         num_coarse=args.num_coarse, num_fine=args.num_fine,
         depth=args.depth, width=args.width, skip=args.skip_layer,
+        hash_log2_size=args.hash_log2_size, hash_bound=args.hash_bound,
         precrop_iterations=args.precrop_iterations, precrop_fraction=args.precrop_fraction,
         seed=args.seed, log_every=args.log_every,
+        **({} if args.learning_rate is None else {"learning_rate": args.learning_rate}),
     )
     device = pick_device(args.device)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -126,7 +147,7 @@ def main() -> int:
     train_views = load_blender(args.scene_dir, "train", args.downscale)
     val_views = load_blender(args.scene_dir, "val", args.downscale, skip=args.val_skip).to(device)
     print(f"{len(train_views)} training views at {train_views.width} x {train_views.height}, "
-          f"{len(val_views)} validation views, device {device}, torch {torch.__version__}")
+          f"{len(val_views)} validation views, model {config.model}, device {device}, torch {torch.__version__}")
 
     trainer = Trainer(train_views, config, device)
     elapsed_before = 0.0
@@ -140,8 +161,8 @@ def main() -> int:
         print(f"resumed from {checkpoint} at step {trainer.step_count}")
     start_table(args.out / "log.csv", LOG_COLUMNS, trainer.step_count)
     start_table(args.out / "validation.csv", VALIDATION_COLUMNS, trainer.step_count)
-    settings = {**asdict(config), "scene": str(args.scene_dir), "downscale": args.downscale,
-                "device": device, "torch": torch.__version__}
+    settings = {**asdict(config), "minutes": args.minutes, "scene": str(args.scene_dir),
+                "downscale": args.downscale, "device": device, "torch": torch.__version__}
     config_file.write_text(json.dumps(settings, indent=2) + "\n")
 
     session_start = time.time()
@@ -174,11 +195,17 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
+    def out_of_time() -> bool:
+        return args.minutes is not None and elapsed() >= 60.0 * args.minutes
+
+    # `last` is decided once per step, before anything is written for it, so
+    # that the step the summary names is the step the checkpoint holds.
+    last = trainer.step_count >= config.iterations or out_of_time()
     last_step, last_time = trainer.step_count, time.time()
-    while trainer.step_count < config.iterations and not stop["requested"]:
+    while not last and not stop["requested"]:
         out = trainer.step()
         step = out.step
-        last = step == config.iterations
+        last = step == config.iterations or out_of_time()
         if step % config.log_every == 0 or last:
             loss, mse = out.loss.item(), out.mse_fine.item()
             now = time.time()
@@ -201,24 +228,29 @@ def main() -> int:
         if step % args.checkpoint_every == 0 or last:
             save_checkpoint(checkpoint, trainer, extra={"elapsed": elapsed()})
 
-    if trainer.step_count < config.iterations:
+    if not last:
         save_checkpoint(checkpoint, trainer, extra={"elapsed": elapsed()})
         print(f"stopped at step {trainer.step_count}; checkpoint saved. "
               f"Run the same command to continue.")
         return 130
+    trained = elapsed()
+    if trainer.step_count < config.iterations:
+        print(f"the run has trained for {args.minutes:g} minutes, its time limit; stopping at step "
+              f"{trainer.step_count}")
 
     scores, _ = evaluate(val_views, TrainResult(trainer.coarse, trainer.fine), config, device)
     mean_score = sum(scores) / len(scores)
     summary = {
         "steps": trainer.step_count,
-        "train_seconds": round(elapsed(), 1),
+        "finished": "iterations" if trainer.step_count >= config.iterations else "minutes",
+        "train_seconds": round(trained, 1),
         "validation_psnr_per_view": [round(s, 2) for s in scores],
         "validation_psnr_mean": round(mean_score, 2),
         **settings,
     }
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"finished at step {trainer.step_count}: mean PSNR on {len(scores)} validation views "
-          f"{mean_score:.2f} dB, {elapsed() / 60:.1f} min of training in total")
+          f"{mean_score:.2f} dB, {trained / 60:.1f} min of training in total")
     print(f"results are in {args.out}")
     return 0
 

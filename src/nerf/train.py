@@ -24,9 +24,11 @@ import torch
 
 from nerf.data import Views
 from nerf.metrics import psnr
-from nerf.model import NeRF
+from nerf.model import HashNeRF, NeRF
 from nerf.rays import get_rays
 from nerf.render import render_image, render_rays
+
+MODELS = ("nerf", "hash")
 
 
 @dataclass
@@ -38,6 +40,13 @@ class TrainConfig:
     synthetic-scene results. It differs from the text of Section 5.3 in two
     ways: 1024 rays per step where the paper says 4096, and 500k iterations
     where the paper says 100-300k.
+
+    `model` chooses the field: "nerf", the paper's network, or "hash", the
+    hash encoding and small networks of Instant-NGP (Mueller et al. 2022).
+    `for_model` gives a configuration with that model's own learning-rate
+    settings; everything else, in particular the sampling and the loss, is
+    the same for both, so that a run with one differs from a run with the
+    other in the model alone.
     """
 
     iterations: int = 500_000
@@ -46,13 +55,26 @@ class TrainConfig:
     num_fine: int = 128             # N_f
     learning_rate: float = 5e-4
     lr_decay_rate: float = 0.1      # learning rate is multiplied by this ...
-    lr_decay_steps: int = 500_000   # ... every this many steps, smoothly
+    lr_decay_steps: int = 500_000   # ... every this many steps, smoothly ...
+    lr_decay_start: int = 0         # ... counting from this step
+    adam_beta2: float = 0.999       # PyTorch's and TensorFlow's default
     adam_eps: float = 1e-7          # TensorFlow's default, stated in the paper
+    weight_decay: float = 0.0       # L2 penalty on the networks' weights (not on hash tables)
+    model: str = "nerf"
+    # The paper's network (model "nerf")
     depth: int = 8
     width: int = 256
     skip: int = 4
     num_freqs_pos: int = 10
     num_freqs_dir: int = 4
+    # Instant-NGP's encoding and networks (model "hash"); see nerf.hashgrid
+    hash_levels: int = 16
+    hash_features: int = 2
+    hash_log2_size: int = 19
+    hash_base_resolution: int = 16
+    hash_finest_resolution: int = 2048
+    hash_bound: float = 1.5
+    hash_width: int = 64
     # Optional warm-up from the released code, off in the paper configuration:
     # for the first `precrop_iterations` steps, sample pixels only from the
     # central `precrop_fraction` of each image, where the object is.
@@ -61,11 +83,61 @@ class TrainConfig:
     seed: int = 0
     log_every: int = 100
 
+    @classmethod
+    def for_model(cls, model: str, **overrides) -> "TrainConfig":
+        """A configuration for `model` with that model's learning-rate settings.
+
+        "nerf" uses the paper's: 5e-4 falling smoothly by a factor of 10 over
+        500k steps. "hash" uses those of Instant-NGP's NeRF configuration:
+        1e-2, Adam with beta2 0.99 and epsilon 1e-15, an L2 penalty of 1e-6
+        on the networks' weights, and a decay by a factor of 0.33 every 10k
+        steps after the first 20k (Instant-NGP steps the rate down; here it
+        falls smoothly through the same values). Keyword arguments override.
+        """
+        if model not in MODELS:
+            raise ValueError(f"unknown model {model!r}: one of {', '.join(MODELS)}")
+        settings = {"model": model}
+        if model == "hash":
+            settings.update(
+                learning_rate=1e-2, lr_decay_rate=0.33, lr_decay_steps=10_000, lr_decay_start=20_000,
+                adam_beta2=0.99, adam_eps=1e-15, weight_decay=1e-6,
+            )
+        settings.update(overrides)
+        return cls(**settings)
+
+
+def build_network(config: TrainConfig) -> torch.nn.Module:
+    """A fresh, untrained field of the kind `config.model` names."""
+    if config.model == "nerf":
+        return NeRF(config.depth, config.width, config.skip, config.num_freqs_pos, config.num_freqs_dir)
+    if config.model == "hash":
+        return HashNeRF(
+            config.hash_levels, config.hash_features, config.hash_log2_size,
+            config.hash_base_resolution, config.hash_finest_resolution, config.hash_bound,
+            config.hash_width, config.num_freqs_dir,
+        )
+    raise ValueError(f"unknown model {config.model!r}: one of {', '.join(MODELS)}")
+
+
+def parameter_groups(networks: list[torch.nn.Module], weight_decay: float) -> list[dict]:
+    """The networks' parameters for Adam: the weights of the layers, with the
+    L2 penalty, and, for a hash model, the tables of the encoding without it.
+    The penalty is Instant-NGP's `l2_reg`, which applies to layer weights only.
+    """
+    layers, tables = [], []
+    for network in networks:
+        for name, parameter in network.named_parameters():
+            (tables if name.endswith("tables") else layers).append(parameter)
+    groups = [{"params": layers, "weight_decay": weight_decay}]
+    if tables:
+        groups.append({"params": tables, "weight_decay": 0.0})
+    return groups
+
 
 @dataclass
 class TrainResult:
-    coarse: NeRF
-    fine: NeRF
+    coarse: torch.nn.Module
+    fine: torch.nn.Module
     history: list[dict] = field(default_factory=list)  # step, loss, psnr, lr, seconds
 
 
@@ -81,8 +153,10 @@ def pick_device(name: str = "auto") -> str:
 
 
 def learning_rate_at(step: int, config: TrainConfig) -> float:
-    """Exponential decay: multiplied by `lr_decay_rate` every `lr_decay_steps`."""
-    return config.learning_rate * config.lr_decay_rate ** (step / config.lr_decay_steps)
+    """Exponential decay: multiplied by `lr_decay_rate` every `lr_decay_steps`,
+    smoothly, from `lr_decay_start` on; constant before that."""
+    progress = max(0, step - config.lr_decay_start) / config.lr_decay_steps
+    return config.learning_rate * config.lr_decay_rate**progress
 
 
 def sample_ray_batch(
@@ -144,17 +218,12 @@ class Trainer:
         self.views = views.to(device)
         self.step_count = 0
 
-        def new_network() -> NeRF:
-            return NeRF(
-                config.depth, config.width, config.skip,
-                config.num_freqs_pos, config.num_freqs_dir,
-            ).to(device)
-
-        self.coarse, self.fine = new_network(), new_network()
+        self.coarse = build_network(config).to(device)
+        self.fine = build_network(config).to(device)
         # One optimiser for both networks: Eq. 6 is a single loss over both.
         self.optimizer = torch.optim.Adam(
-            list(self.coarse.parameters()) + list(self.fine.parameters()),
-            lr=config.learning_rate, eps=config.adam_eps,
+            parameter_groups([self.coarse, self.fine], config.weight_decay),
+            lr=config.learning_rate, betas=(0.9, config.adam_beta2), eps=config.adam_eps,
         )
 
     def step(self) -> StepOutput:
@@ -225,7 +294,8 @@ def load_checkpoint(path, trainer: Trainer) -> dict:
     """
     state = torch.load(path, map_location="cpu", weights_only=True)
     free = {"iterations", "log_every"}
-    saved = {k: v for k, v in state["config"].items() if k not in free}
+    # A checkpoint from before a setting existed was made with its default.
+    saved = {k: v for k, v in {**asdict(TrainConfig()), **state["config"]}.items() if k not in free}
     current = {k: v for k, v in asdict(trainer.config).items() if k not in free}
     if saved != current:
         changed = sorted(k for k in current if saved.get(k) != current[k])
@@ -235,8 +305,8 @@ def load_checkpoint(path, trainer: Trainer) -> dict:
 
 
 class TrainedNetworks(NamedTuple):
-    coarse: NeRF
-    fine: NeRF
+    coarse: torch.nn.Module
+    fine: torch.nn.Module
     config: TrainConfig   # the settings they were trained with
     step: int             # how many training steps they have had
 
@@ -252,10 +322,7 @@ def load_networks(path, device: str = "cpu") -> TrainedNetworks:
     config = TrainConfig(**state["config"])
     networks = {}
     for name in ("coarse", "fine"):
-        network = NeRF(
-            config.depth, config.width, config.skip,
-            config.num_freqs_pos, config.num_freqs_dir,
-        )
+        network = build_network(config)
         network.load_state_dict(state[name])
         networks[name] = network.to(device)
     return TrainedNetworks(networks["coarse"], networks["fine"], config, state["step"])

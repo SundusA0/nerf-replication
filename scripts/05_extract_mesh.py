@@ -5,9 +5,9 @@
 The surface is taken from the fine network's density, as in the authors'
 extract_mesh notebook: 257 grid points per axis spanning [-1.2, 1.2], and
 marching cubes at a density threshold. Three things are added to the notebook's
-steps. Empty pockets that the surface seals off on all sides are filled first,
-so that the mesh has no hidden inner walls. Small pieces floating in empty
-space are removed. Every vertex is given the colour the network shows there.
+steps. The empty space inside the object is filled first, so that the mesh
+has no hidden inner walls. Small pieces floating in empty space are removed.
+Every vertex is given the colour the network shows there.
 
 The results go into a directory next to the checkpoint, named after the
 checkpoint's step (or into --out):
@@ -65,7 +65,7 @@ from nerf.mesh import (
     drop_small_pieces,
     enclosed_volume,
     extract_surface,
-    fill_cavities,
+    fill_inside,
     fit_threshold,
     is_closed,
     rasterise,
@@ -238,10 +238,10 @@ def extract(args) -> int:
             )
             which = "the authors' value" if threshold == 50 else "the lowest"
             print(f"    -> {threshold:g}, {which} within 0.01 of the best")
-        filled, pockets = fill_cavities(density, threshold)
+        filled, pockets, sealed = fill_inside(density, threshold)
         if pockets and (filled > threshold).all():
             print(f"At a threshold of {threshold:g} the object fills the grid out to every face, and the only "
-                  f"empty space is sealed inside it.")
+                  f"empty space is inside it.")
             print("There is no outer surface to extract. A larger --bound may reach its outside.")
             return 2
         surface = extract_surface(filled, args.bound, threshold)
@@ -251,7 +251,7 @@ def extract(args) -> int:
         return 2
     above = (density > threshold).float().mean().item()
     print(f"{100 * above:.2f} % of the grid is above the threshold of {threshold:g}; "
-          f"{pockets:,} grid points in sealed pockets were filled")
+          f"{pockets:,} grid points inside the object were filled, {sealed:,} of them in sealed pockets")
     mesh, kept, dropped = drop_small_pieces(surface, args.min_piece)
     mesh = colour_vertices(networks.fine, mesh, voxel, device)
 
@@ -297,7 +297,8 @@ def extract(args) -> int:
         "triangles": mesh.faces.shape[0],
         "pieces": kept,
         "small_pieces_removed": dropped,
-        "pocket_points_filled": pockets,
+        "points_filled_inside": pockets,
+        "points_filled_in_pockets": sealed,
         "closed_surface": closed,
         "volume": volume,
         "area": round(surface_area(mesh), 5),

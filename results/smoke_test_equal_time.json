@@ -1,0 +1,67 @@
+{
+  "iterations": 9100,
+  "model": "nerf",
+  "seed": 0,
+  "device": "cpu",
+  "torch": "2.14.1+cu130",
+  "machine": "x86_64",
+  "train_seconds": 345.2,
+  "psnr_blank_image": 8.49,
+  "psnr_held_out_views": [
+    27.97,
+    31.16,
+    29.0,
+    28.14
+  ],
+  "psnr_held_out_mean": 29.07,
+  "psnr_required": 20.0,
+  "mesh": {
+    "threshold": 4.0,
+    "vertices": 26247,
+    "triangles": 52494,
+    "pieces": 3,
+    "outline_iou_per_view": [
+      0.967,
+      0.974,
+      0.971,
+      0.97
+    ],
+    "outline_iou": 0.971,
+    "surface_distance": 0.0102,
+    "surface_distance_signed": -0.0038,
+    "volume_ratio": 0.972,
+    "colour_error": 0.015,
+    "required": {
+      "outline_iou": 0.92,
+      "surface_distance": 0.04,
+      "volume_error": 0.2,
+      "colour_error": 0.1
+    },
+    "for_comparison": {
+      "visual_hull_of_the_training_outlines": {
+        "outline_iou_per_view": [
+          0.96,
+          0.965,
+          0.959,
+          0.964
+        ],
+        "outline_iou": 0.962,
+        "surface_distance": 0.0156,
+        "surface_distance_signed": -0.0142,
+        "volume_ratio": 0.926
+      },
+      "exact_density": {
+        "outline_iou_per_view": [
+          0.981,
+          0.981,
+          0.985,
+          0.983
+        ],
+        "outline_iou": 0.983,
+        "surface_distance": 0.0035,
+        "surface_distance_signed": -0.0002,
+        "volume_ratio": 0.998
+      }
+    }
+  }
+}

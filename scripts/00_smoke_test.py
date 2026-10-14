@@ -14,6 +14,9 @@ of minutes on a laptop CPU. Writes
                                   mesh in its colours, the mesh's shape
     results/smoke_test.json       the numbers
 
+(with --model hash: smoke_test_hash.png, smoke_test_hash_mesh.png and
+smoke_test_hash.json, so that the two models' records sit side by side)
+
 and exits with an error if the mean held-out PSNR is below 20 dB or if the
 mesh, seen from the held-out viewpoints, misses any of these: its outline
 overlaps the true outline by at least 0.92 (intersection over union); the
@@ -25,7 +28,9 @@ of a training image covers about 0.06 of the scene.
 
 The network here is deliberately small (4 layers of 64 units, 16 + 32 samples
 per ray, 256 rays per step) so that this runs without a GPU. It checks that the
-whole pipeline learns; it is not the paper's configuration.
+whole pipeline learns; it is not the paper's configuration. --model hash runs
+the same check with Instant-NGP's hash encoding and small networks in place of
+the paper's network, with its tables made small in the same spirit.
 
 Two meshes that involve no training are measured the same way, to say what
 the numbers are worth: the visual hull carved from the outlines in the 24
@@ -56,7 +61,7 @@ from nerf.mesh import (
     drop_small_pieces,
     enclosed_volume,
     extract_surface,
-    fill_cavities,
+    fill_inside,
     fit_threshold,
     is_closed,
     rasterise,
@@ -64,7 +69,7 @@ from nerf.mesh import (
     silhouette_iou,
 )
 from nerf.rays import get_rays
-from nerf.train import TrainConfig, evaluate, psnr, train
+from nerf.train import MODELS, TrainConfig, evaluate, psnr, train
 
 PSNR_REQUIRED = 20.0
 # What the mesh has to reach. A run that works clears each with room to spare.
@@ -116,7 +121,7 @@ def against_the_scene(mesh, views) -> dict:
     return measures
 
 
-def measure_mesh(fine, train_views, device: str, out: Path) -> dict:
+def measure_mesh(fine, train_views, device: str, out: Path, name: str = "smoke_test") -> dict:
     """Mesh the trained density and measure it against the exact scene.
 
     The threshold is fitted to the silhouettes in eight of the training
@@ -133,7 +138,7 @@ def measure_mesh(fine, train_views, device: str, out: Path) -> dict:
         threshold, _ = fit_threshold(density, MESH_BOUND, train_views.select(spread))
     except ValueError as error:
         return {"error": str(error)}
-    filled, _ = fill_cavities(density, threshold)
+    filled, _, _ = fill_inside(density, threshold)
     mesh, pieces, _ = drop_small_pieces(extract_surface(filled, MESH_BOUND, threshold))
     mesh = colour_vertices(fine, mesh, 2 * MESH_BOUND / (MESH_RESOLUTION - 1), device)
 
@@ -172,7 +177,7 @@ def measure_mesh(fine, train_views, device: str, out: Path) -> dict:
         return torch.nn.functional.pad(tile.permute(2, 0, 1), (1, 1, 1, 1), value=0.75).permute(1, 2, 0)
 
     grid = torch.cat([torch.cat([framed(tile) for tile in column], dim=0) for column in columns], dim=1)
-    Image.fromarray((grid.clamp(0, 1) * 255).round().byte().numpy()).save(out / "smoke_test_mesh.png")
+    Image.fromarray((grid.clamp(0, 1) * 255).round().byte().numpy()).save(out / f"{name}_mesh.png")
     return result
 
 
@@ -198,6 +203,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--iterations", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--model", default="nerf", choices=MODELS,
+                        help="nerf (default): the paper's network; hash: Instant-NGP's encoding")
     parser.add_argument("--device", default="cpu", help="cpu (default), mps or cuda")
     parser.add_argument("--out", type=Path, default=Path("results"))
     args = parser.parse_args()
@@ -208,9 +215,11 @@ def main() -> int:
     print(f"{len(train_views)} training views, {len(test_views)} held-out views")
     print(f"PSNR of a blank white image on the held-out views: {empty:.2f} dB")
 
-    config = TrainConfig(
+    config = TrainConfig.for_model(
+        args.model,
         iterations=args.iterations, batch_size=256, num_coarse=16, num_fine=32,
-        depth=4, width=64, skip=2,
+        depth=4, width=64, skip=2,                             # the paper's network, made small
+        hash_log2_size=15, hash_finest_resolution=512,         # Instant-NGP's tables, made small
         lr_decay_steps=10**9,  # effectively a constant learning rate for a short run
         log_every=200, seed=args.seed,
     )
@@ -232,9 +241,10 @@ def main() -> int:
     grid = torch.cat([row(test_views.images), row(renders.clamp(0, 1))], dim=0)
     image = Image.fromarray((grid * 255).round().byte().numpy())
     image = image.resize((image.width * 4, image.height * 4), Image.NEAREST)
-    image.save(args.out / "smoke_test.png")
+    stem = "smoke_test" if args.model == "nerf" else f"smoke_test_{args.model}"
+    image.save(args.out / f"{stem}.png")
 
-    mesh = measure_mesh(result.fine, train_views, args.device, args.out)
+    mesh = measure_mesh(result.fine, train_views, args.device, args.out, stem)
     if "error" in mesh:
         print(f"mesh: there is {mesh['error']}")
     else:
@@ -251,6 +261,7 @@ def main() -> int:
 
     summary = {
         "iterations": args.iterations,
+        "model": args.model,
         "seed": args.seed,
         "device": args.device,
         "torch": torch.__version__,
@@ -262,10 +273,10 @@ def main() -> int:
         "psnr_required": PSNR_REQUIRED,
         "mesh": mesh,
     }
-    (args.out / "smoke_test.json").write_text(json.dumps(summary, indent=2) + "\n")
-    pictures = ["smoke_test.png"] + ([] if "error" in mesh else ["smoke_test_mesh.png"])
-    print("wrote " + ", ".join(str(args.out / name) for name in pictures)
-          + f" and {args.out / 'smoke_test.json'}")
+    (args.out / f"{stem}.json").write_text(json.dumps(summary, indent=2) + "\n")
+    pictures = [f"{stem}.png"] + ([] if "error" in mesh else [f"{stem}_mesh.png"])
+    print("wrote " + ", ".join(str(args.out / picture) for picture in pictures)
+          + f" and {args.out / f'{stem}.json'}")
 
     failures = [f"mean held-out PSNR is below {PSNR_REQUIRED} dB"] if mean_psnr < PSNR_REQUIRED else []
     failures += mesh_failures(mesh)

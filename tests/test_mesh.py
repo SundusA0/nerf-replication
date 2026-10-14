@@ -302,6 +302,136 @@ def test_empty_space_that_reaches_a_face_of_the_grid_is_the_outside():
     assert pockets((4, 4, 4), (4, 4, 5), (2, 2, 2)) == 3
 
 
+def test_lines_of_sight_reach_what_a_straight_line_through_empty_space_reaches():
+    # A 9^3 grid with a solid block in the middle and open space around it:
+    # every outside point is reached, the block's skin is reached (a line
+    # gets as far as the first solid point), its core is not.
+    density = torch.zeros(9, 9, 9)
+    density[2:7, 2:7, 2:7] = 40.0
+    reached = meshing.lines_of_sight(density, 20.0)
+    assert reached.shape == density.shape and reached.dtype == torch.bool
+    assert reached[density == 0].all()
+    core = torch.zeros_like(reached)
+    core[3:6, 3:6, 3:6] = True
+    assert not reached[core].any()
+    assert reached[(density > 0) & ~core].all()
+    # what is solid is decided by the threshold, as for marching cubes: at a
+    # threshold of 40 the block is empty space and everything is reached, and
+    # a point at the threshold is empty
+    assert meshing.lines_of_sight(density, 40.0).all()
+    assert not meshing.lines_of_sight(density, 39.9)[core].any()
+    # a single solid point blocks a line, however faint it is above the
+    # threshold, and haze below the threshold blocks nothing
+    boxed = torch.full((9, 9, 9), 40.0)
+    boxed[:5, 4, 4] = 0.0                                   # a tunnel from the face x = 0 to the point (4, 4, 4)
+    assert meshing.lines_of_sight(boxed, 20.0)[4, 4, 4]
+    boxed[2, 4, 4] = 20.01
+    assert not meshing.lines_of_sight(boxed, 20.0)[4, 4, 4]
+    boxed[2, 4, 4] = 20.0
+    assert meshing.lines_of_sight(boxed, 20.0)[4, 4, 4]
+    haze = torch.full((9, 9, 9), 6.0)
+    assert meshing.lines_of_sight(haze, 20.0).all()
+    # a closed box is not reached inside
+    boxed = torch.full((9, 9, 9), 40.0)
+    boxed[4, 4, 4] = 0.0
+    assert not meshing.lines_of_sight(boxed, 20.0)[4, 4, 4]
+
+
+def test_lines_of_sight_run_along_all_26_lattice_directions():
+    # A point in a solid block sees out only through a short straight hole to
+    # a face of the grid; the hole is placed so that the light comes in along
+    # each of the 26 directions in turn, an axis, a face diagonal or a cube
+    # diagonal, in either sense. The point mirrored through the centre has
+    # no hole and is not reached.
+    centre = torch.tensor([4, 4, 4])
+    directions = [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)]
+    assert len(directions) == 26
+    for direction in directions:
+        d = torch.tensor(direction)
+        point, mirror = tuple((centre - 2 * d).tolist()), tuple((centre + 2 * d).tolist())
+        boxed = torch.full((9, 9, 9), 40.0)
+        boxed[point] = 0.0
+        boxed[tuple((centre - 3 * d).tolist())] = 0.0        # the hole, against the light's direction ...
+        boxed[tuple((centre - 4 * d).tolist())] = 0.0        # ... out to the face
+        reached = meshing.lines_of_sight(boxed, 20.0)
+        assert reached[point], direction
+        assert not reached[mirror], direction
+    # a hole that bends is not a line of sight, nor is one in a direction
+    # between the lattice's
+    bent = torch.full((9, 9, 9), 40.0)
+    bent[4, 4, 4] = bent[5, 4, 4] = bent[5, 5, 4] = bent[5, 6, 4] = bent[5, 7, 4] = bent[5, 8, 4] = 0.0
+    assert not meshing.lines_of_sight(bent, 20.0)[4, 4, 4]
+    assert meshing.lines_of_sight(bent, 20.0)[5, 6, 4]       # the straight part of it is
+    oblique = torch.full((9, 9, 9), 40.0)
+    for k in range(5):                                        # two steps in x for one in y
+        oblique[k, 4 + k // 2, 4] = 0.0
+        oblique[min(k + 1, 8), 4 + k // 2, 4] = 0.0
+    assert not meshing.lines_of_sight(oblique, 20.0)[4, 6, 4]
+
+
+def test_fill_inside_fills_what_leaks_out_as_well_as_sealed_pockets():
+    # A ball whose inside is a speckle of empty points, as the hash model
+    # leaves it: through the ball's surface the speckle leaks out at a few
+    # gaps, so hardly any of it is a sealed pocket, yet no line of sight
+    # through empty space reaches it. Filling it gives back the whole ball.
+    bound, resolution = 1.0, 65
+    density = meshing.density_grid(hard_ball(radius=0.6), bound, resolution)
+    axis = torch.linspace(-bound, bound, resolution)
+    grid = torch.stack(torch.meshgrid(axis, axis, axis, indexing="ij"), dim=-1)
+    distance = grid.norm(dim=-1)
+    generator = torch.Generator().manual_seed(0)
+    speckle = (torch.rand(density.shape, generator=generator) < 0.4) & (distance < 0.52)
+    density[speckle] = 0.0
+    for gap in ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, -1.0, 0.0)):   # one-cell holes from the surface to the speckle
+        line = (grid * torch.tensor(gap)).sum(-1)
+        off_line = (grid * (1 - torch.tensor(gap).abs())).norm(dim=-1)
+        density[(off_line < 0.02) & (line > 0.5) & (line < 0.62)] = 0.0
+    before = density.clone()
+    sealed_only, pockets = meshing.fill_cavities(density, 20.0)
+    assert pockets < 0.3 * int(speckle.sum())                     # most of the speckle leaks
+    leaky = meshing.extract_surface(sealed_only, bound, 20.0)
+    assert meshing.enclosed_volume(leaky) < 0.9 * 4 / 3 * math.pi * 0.6**3
+
+    filled, count, in_pockets = meshing.fill_inside(density, 20.0)
+    assert in_pockets == pockets and count >= 0.99 * int(speckle.sum())
+    left = speckle & (filled != 40.0)                              # the few speckle points a line through a gap reaches
+    assert int(left.sum()) < 0.01 * int(speckle.sum()) and meshing.lines_of_sight(density, 20.0)[left].all()
+    assert torch.equal(filled[distance > 0.65], density[distance > 0.65])   # nothing outside is touched
+    whole = meshing.extract_surface(filled, bound, 20.0)
+    assert meshing.is_closed(whole) and meshing.piece_of_each_face(whole).unique().numel() == 1
+    assert meshing.enclosed_volume(whole) == pytest.approx(4 / 3 * math.pi * 0.6**3, rel=0.03)
+    assert torch.equal(density, before)                            # the grid given is untouched
+
+    # What a line of sight can enter stays open. A hollow with a straight
+    # tunnel to the outside is not a pocket; the lines through the tunnel
+    # keep it and the part of the hollow in line with it, and the rest of the
+    # hollow, which no line reaches, is filled. A slab leaves the space
+    # beneath it alone, and haze below the threshold is not an object.
+    tunnelled = meshing.density_grid(hollow_ball(tunnel=True), bound, resolution)
+    assert meshing.fill_cavities(tunnelled, 20.0)[1] == 0
+    in_line = (grid[..., 1].abs() < 0.08) & (grid[..., 2].abs() < 0.08) & (grid[..., 0] > -0.3)
+    filled, count, in_pockets = meshing.fill_inside(tunnelled, 20.0)
+    assert in_pockets == 0 and count == int(((distance < 0.3) & ~in_line).sum())   # all of the hollow that is out of line
+    assert torch.equal(filled[in_line], tunnelled[in_line])
+    assert (filled[(distance < 0.2) & (grid[..., 0] < -0.1) & ~in_line] == 40.0).all()   # the back of the hollow
+    slab = torch.zeros(resolution, resolution, resolution)
+    slab[:, :, 40:44] = 40.0
+    assert meshing.fill_inside(slab, 20.0)[1] == 0
+    haze = torch.full((resolution, resolution, resolution), 6.0)
+    haze[20:30, 20:30, 20:30] = 40.0
+    assert meshing.fill_inside(haze, 20.0)[1] == 0
+    # A pocket is sealed when no path along the axes leads out; a diagonal
+    # line of sight may still reach it. Empty points along a diagonal are
+    # each such a pocket, all reached by the line; they are filled as
+    # pockets, and counted.
+    diagonal = torch.full((9, 9, 9), 40.0)
+    for k in range(4, 9):
+        diagonal[k, k, 4] = 0.0                                # from (4, 4, 4) out to the corner (8, 8, 4)
+    assert meshing.lines_of_sight(diagonal, 20.0)[4, 4, 4] and meshing.fill_cavities(diagonal, 20.0)[1] == 4
+    filled, count, in_pockets = meshing.fill_inside(diagonal, 20.0)
+    assert (count, in_pockets) == (4, 4) and filled[4, 4, 4] == 40.0 and filled[8, 8, 4] == 0.0
+
+
 # --------------------------------------------------------------------------
 # Colours and the file
 # --------------------------------------------------------------------------
@@ -933,7 +1063,7 @@ def test_script_writes_a_mesh_of_the_scene_with_its_measures(extractor, scene, m
     # The mesh is taken from the fine network. (The coarse one here is a
     # single ball, which would give one piece.)
     assert summary["pieces"] == 4 and summary["small_pieces_removed"] == 0
-    assert summary["closed_surface"] is True and summary["pocket_points_filled"] == 0
+    assert summary["closed_surface"] is True and summary["points_filled_inside"] == 0
     assert summary["box"]["x"] == pytest.approx([-0.7, 1.45], abs=SCENE_VOXEL)
     assert summary["box"]["y"] == pytest.approx([-0.7, 1.45], abs=SCENE_VOXEL)
     assert summary["box"]["z"] == pytest.approx([-0.7, 1.2], abs=SCENE_VOXEL)
@@ -957,7 +1087,7 @@ def test_script_writes_a_mesh_of_the_scene_with_its_measures(extractor, scene, m
     for candidate, score in lines:
         assert float(score) == pytest.approx(summary["fit_silhouette_iou"][candidate], abs=6e-4)
     assert "    -> 30, the lowest within 0.01 of the best\n" in printed
-    assert "; 0 grid points in sealed pockets were filled\n" in printed
+    assert "; 0 grid points inside the object were filled, 0 of them in sealed pockets\n" in printed
     assert f"closed surface: yes   volume {summary['volume']:.4f}   area {summary['area']:.4f}   x " in printed
 
     # The score is from every second test view, at the photographs' size.
@@ -1131,6 +1261,34 @@ def test_a_floating_speck_is_removed_unless_asked_to_keep_it(extractor, scene, t
     assert all(spoiled[candidate] < plain[candidate] for candidate in plain)
 
 
+def test_a_speckled_inside_that_leaks_out_is_filled_by_the_script(extractor, scene, tmp_path):
+    # Inside a ball, density that comes and goes from point to point, as the
+    # hash model leaves it, with three straight gaps from the surface into it,
+    # so that the empty part of the speckle is open to the outside and no
+    # pocket is sealed. The mesh is still the whole ball.
+    def speckled(points, view_dirs):
+        sigma, rgb = hard_ball(radius=0.6)(points, view_dirs)
+        inner = points.norm(dim=-1) < 0.52
+        pattern = (points * points.new_tensor([73.1, 51.7, 29.3])).sum(dim=-1) % 1.0 < 0.4
+        sigma = torch.where(inner & pattern, 0.0, sigma)
+        for axis in range(3):
+            across = points.clone()
+            across[..., axis] = 0.0
+            gap = (across.norm(dim=-1) < 0.02) & (points[..., axis] > 0.3)
+            sigma = torch.where(gap, 0.0, sigma)
+        return sigma, rgb
+
+    extractor.load_networks = networks_of(speckled)
+    assert extract(extractor, scene, "--threshold", "20", "--out", str(tmp_path / "speckled")) == 0
+    summary = json.loads((tmp_path / "speckled" / "summary.json").read_text())
+    assert summary["points_filled_inside"] > 1000
+    assert summary["closed_surface"] is True and summary["pieces"] == 1
+    assert summary["volume"] == pytest.approx(4 / 3 * math.pi * 0.6**3, rel=0.02)
+    # the pocket rule alone would have left the part of the speckle that the gaps reach
+    density = meshing.density_grid(speckled, SCENE_BOUND, SCENE_RESOLUTION)
+    assert 0 < meshing.fill_cavities(density, 20.0)[1] < summary["points_filled_inside"]
+
+
 def test_a_hollow_object_gets_no_inner_wall(extractor, scene, tmp_path, capsys):
     extractor.load_networks = networks_of(hollow_ball(outer=0.9, inner=0.4))
     assert extract(extractor, scene, "--threshold", "20", "--out", str(tmp_path / "hollow")) == 0
@@ -1138,8 +1296,8 @@ def test_a_hollow_object_gets_no_inner_wall(extractor, scene, tmp_path, capsys):
     axis = torch.linspace(-SCENE_BOUND, SCENE_BOUND, SCENE_RESOLUTION)
     distance = torch.stack(torch.meshgrid(axis, axis, axis, indexing="ij"), dim=-1).norm(dim=-1)
     in_hollow = int((distance < 0.4).sum())
-    assert summary["pocket_points_filled"] == in_hollow > 5000
-    assert f"; {in_hollow:,} grid points in sealed pockets were filled\n" in capsys.readouterr().out
+    assert summary["points_filled_inside"] == summary["points_filled_in_pockets"] == in_hollow > 5000
+    assert f"; {in_hollow:,} grid points inside the object were filled, {in_hollow:,} of them in sealed pockets\n" in capsys.readouterr().out
     assert summary["pieces"] == 1 and summary["closed_surface"] is True
     assert summary["volume"] == pytest.approx(4 / 3 * math.pi * 0.9**3, rel=0.01)       # the whole ball
     # what is reported as above the threshold is the network's density as it is: the shell alone
@@ -1430,6 +1588,35 @@ def test_smoke_test_meshes_a_network_and_compares_it_with_a_hull_and_the_exact_s
 
     picture = Image.open(tmp_path / "smoke_test_mesh.png")
     assert picture.size == (4 * 258, 3 * 258)                      # four views across; view, colours, shape down
+
+
+def test_smoke_test_fills_a_speckled_inside_that_leaks(smoke, tmp_path):
+    # The sphere scene with the red sphere's inside turned to speckle that
+    # leaks out through three gaps, as the hash model leaves an inside. The
+    # measured mesh still has the spheres' volume.
+    scene = SphereScene()
+
+    def speckled(points, view_dirs):
+        sigma, rgb = scene(points, view_dirs)
+        inner = points.norm(dim=-1) < 0.62
+        pattern = (points * points.new_tensor([73.1, 51.7, 29.3])).sum(dim=-1) % 1.0 < 0.4
+        sigma = torch.where(inner & pattern, 0.0, sigma)
+        for axis in range(3):
+            across = points.clone()
+            across[..., axis] = 0.0
+            sigma = torch.where((across.norm(dim=-1) < 0.02) & (points[..., axis] > 0.3) & (points[..., axis] < 0.72), 0.0, sigma)
+        return sigma, rgb
+
+    train_views = analytic_views(24, image_size=48)
+    result = smoke.measure_mesh(speckled, train_views, "cpu", tmp_path)
+    assert result["volume_ratio"] == pytest.approx(1.0, abs=0.06)
+    assert smoke.mesh_failures(result) == []
+    # with sealed pockets alone, the red sphere would have been largely hollow
+    density = meshing.density_grid(speckled, smoke.MESH_BOUND, smoke.MESH_RESOLUTION)
+    leaky, _ = meshing.fill_cavities(density, result["threshold"])
+    hollow = meshing.extract_surface(leaky, smoke.MESH_BOUND, result["threshold"])
+    assert meshing.enclosed_volume(hollow) < 0.95 * meshing.enclosed_volume(
+        meshing.extract_surface(meshing.fill_inside(density, result["threshold"])[0], smoke.MESH_BOUND, result["threshold"]))
 
 
 def test_smoke_test_closes_its_mesh_at_the_edge_of_the_grid_and_fills_its_pockets(smoke, tmp_path):

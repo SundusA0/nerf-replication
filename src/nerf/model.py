@@ -1,4 +1,5 @@
-"""The NeRF network (Mildenhall et al. 2020, Section 3 and Fig. 7).
+"""The NeRF network (Mildenhall et al. 2020, Section 3 and Fig. 7), and the
+network of Instant-NGP (Mueller et al. 2022) as an alternative.
 
 A scene is stored as a function, not as voxels or a mesh:
 
@@ -8,6 +9,9 @@ x is a 3D position, d the direction it is viewed from, sigma the volume density
 at x and c the colour x emits towards d. F_theta is a small fully connected
 network and theta, its weights, are the only thing that is trained. One network
 represents one scene.
+
+Both classes here have the same interface, (points, view_dirs) -> (sigma, rgb),
+so the renderer, the training loop and the scripts do not care which is used.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import torch
 from torch import nn
 
 from nerf.encoding import encoding_dim, positional_encoding
+from nerf.hashgrid import HashGridEncoding, truncated_exp
 
 
 class NeRF(nn.Module):
@@ -111,4 +116,77 @@ class NeRF(nn.Module):
         h = self.feature(h)
         h = torch.relu(self.dir_layer(torch.cat([h, d], dim=-1)))
         rgb = torch.sigmoid(self.rgb_head(h))
+        return sigma, rgb
+
+
+class HashNeRF(nn.Module):
+    """Instant-NGP's field (Mueller et al. 2022, Section 5.4): the hash
+    encoding of the position, then two small networks.
+
+      1. The encoded position, L * F = 32 numbers, goes through one hidden
+         layer of 64 units (ReLU) to 16 outputs. The first output is the
+         density, read through a truncated exp so it is positive; all 16 go
+         on as features of the position.
+      2. Those 16 numbers and the encoded direction, the same gamma(d) of 27
+         numbers that NeRF uses, go through two hidden layers of 64 units to
+         RGB, with a sigmoid.
+
+    As in NeRF, density is computed before the direction enters, so geometry
+    looks the same from every viewpoint. Instant-NGP encodes directions with
+    spherical harmonics instead of frequencies; NeRF's encoding is kept here
+    so that the position encoding is the only thing that differs between the
+    two models.
+
+    Points outside the encoding's box [-bound, bound]^3 get density 0: the
+    scene is known to lie inside it, and the encoding has no entries for
+    anywhere else.
+
+    Weights start Glorot-uniform with zero biases, like NeRF's.
+
+    Args:
+        num_levels, features_per_level, log2_table_size, base_resolution,
+            finest_resolution, bound: see `HashGridEncoding`.
+        width: units per hidden layer (64 in Instant-NGP).
+        num_freqs_dir: L for directions (4, as in NeRF).
+    """
+
+    def __init__(
+        self,
+        num_levels: int = 16,
+        features_per_level: int = 2,
+        log2_table_size: int = 19,
+        base_resolution: int = 16,
+        finest_resolution: int = 2048,
+        bound: float = 1.5,
+        width: int = 64,
+        num_freqs_dir: int = 4,
+    ) -> None:
+        super().__init__()
+        self.num_freqs_dir = num_freqs_dir
+        self.encoding = HashGridEncoding(
+            num_levels, features_per_level, log2_table_size, base_resolution, finest_resolution, bound,
+        )
+        dir_dim = encoding_dim(3, num_freqs_dir)
+        self.density_net = nn.Sequential(
+            nn.Linear(self.encoding.output_dim, width), nn.ReLU(), nn.Linear(width, 16),
+        )
+        self.colour_net = nn.Sequential(
+            nn.Linear(16 + dir_dim, width), nn.ReLU(),
+            nn.Linear(width, width), nn.ReLU(),
+            nn.Linear(width, 3),
+        )
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self, points: torch.Tensor, view_dirs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate the field; same arguments and results as `NeRF.forward`."""
+        features, inside = self.encoding(points)
+        h = self.density_net(features)
+        sigma = truncated_exp(h[..., 0]) * inside.to(h.dtype)
+        d = positional_encoding(view_dirs, self.num_freqs_dir)
+        rgb = torch.sigmoid(self.colour_net(torch.cat([h, d], dim=-1)))
         return sigma, rgb

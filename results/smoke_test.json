@@ -1,10 +1,11 @@
 {
   "iterations": 2000,
+  "model": "nerf",
   "seed": 0,
   "device": "cpu",
   "torch": "2.14.1",
   "machine": "arm64",
-  "train_seconds": 35.7,
+  "train_seconds": 33.7,
   "psnr_blank_image": 8.49,
   "psnr_held_out_views": [
     23.82,
@@ -16,8 +17,8 @@
   "psnr_required": 20.0,
   "mesh": {
     "threshold": 3.0,
-    "vertices": 31822,
-    "triangles": 63860,
+    "vertices": 31698,
+    "triangles": 63596,
     "pieces": 2,
     "outline_iou_per_view": [
       0.956,

@@ -5,7 +5,8 @@ surface, and most uses of a 3D model need a surface. Density does not depend
 on the viewing direction, so the surface can be read off it directly:
 
   density_grid       sample the density on a regular grid
-  fill_cavities      close the empty pockets sealed inside the object
+  fill_inside        fill the empty space inside the object: pockets sealed
+                     on all sides, and whatever no line of sight reaches
   extract_surface    marching cubes: the surface where it crosses a threshold
   drop_small_pieces  remove specks of density that float in empty space
   colour_vertices    give each vertex the colour the field shows there
@@ -130,6 +131,82 @@ def fill_cavities(density: torch.Tensor, threshold: float) -> tuple[torch.Tensor
     filled = density.clone()
     filled[sealed] = density.max()
     return filled, int(sealed.sum())
+
+
+def lines_of_sight(density: torch.Tensor, threshold: float) -> torch.Tensor:
+    """Which grid points a straight line from outside the grid reaches through
+    empty space.
+
+    Empty space is the grid points not above `threshold`, as for marching
+    cubes; the others are solid and block a line. The lines are those of the
+    grid's lattice: through every grid point, in each of the 26 directions
+    that step to a neighbouring grid point (along an axis, a face diagonal or
+    a cube diagonal), from the first grid point on that line to the last. A
+    point is reached if some line gets to it without passing a solid point
+    before it; a solid point is itself reached when a line gets that far,
+    which is what lets the surface be drawn through it.
+
+    A hollow that opens to the outside only in a direction between those of
+    the lattice is not reached, and `fill_inside` fills it.
+
+    Args:
+        density: (R, R, R) grid from `density_grid`.
+        threshold: density at which empty space ends and the object begins.
+
+    Returns:
+        (R, R, R) bool: True where some line of sight reaches the point.
+    """
+    resolution = density.shape[0]
+    solid = (density > threshold).to(torch.int32)
+    reached = torch.zeros_like(density, dtype=torch.bool)
+    directions = [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)]
+    for direction in directions:
+        # Flip the axes the line runs down, so that it always advances towards
+        # higher indices; then the number of solid points before a point is
+        # that before the previous point on the line, plus one if that point
+        # is solid. Each layer of the grid follows from the one before it.
+        flipped = [axis for axis, sign in enumerate(direction) if sign < 0]
+        along = solid.flip(flipped) if flipped else solid
+        moving = [axis for axis, sign in enumerate(direction) if sign != 0]
+        blocked = torch.zeros_like(along)
+        for k in range(1, resolution):
+            source, target = [], []
+            for axis in range(3):
+                if axis == moving[0]:
+                    source.append(k - 1), target.append(k)
+                elif axis in moving:
+                    source.append(slice(0, resolution - 1)), target.append(slice(1, resolution))
+                else:
+                    source.append(slice(None)), target.append(slice(None))
+            blocked[tuple(target)] = blocked[tuple(source)] + along[tuple(source)]
+        seen = blocked == 0
+        reached |= seen.flip(flipped) if flipped else seen
+    return reached
+
+
+def fill_inside(density: torch.Tensor, threshold: float) -> tuple[torch.Tensor, int, int]:
+    """Fill the empty space inside the object, so that the mesh has no walls there.
+
+    The grid points not above `threshold` are empty space. Two kinds of it
+    lie inside the object: pockets that the surface seals off on all sides
+    (`fill_cavities`), and space that no straight line from outside the grid
+    reaches through empty space (`lines_of_sight`). The inside of an object
+    is seen by no camera, so the density there is whatever training happened
+    to leave: the paper's network tends to fill it in, while the hash model
+    leaves a speckle of high and low values, which marching cubes would turn
+    into walls within walls, and which can leak out through the surface so
+    that no pocket is sealed. Both kinds are raised to the grid's maximum.
+    That does not move a vertex of the outer surface, which is drawn where
+    lines of sight do reach; it does fill a hollow whose only opening lies in
+    a direction between those of the lattice.
+
+    Returns the filled grid, the number of grid points that were raised, and
+    how many of those were in sealed pockets.
+    """
+    filled, sealed = fill_cavities(density, threshold)
+    hidden = (density <= threshold) & ~lines_of_sight(density, threshold)
+    filled[hidden] = density.max()
+    return filled, int((hidden | (filled != density)).sum()), sealed
 
 
 def extract_surface(density: torch.Tensor, bound: float, threshold: float = 50.0) -> Mesh:
